@@ -21,7 +21,7 @@ from collections import defaultdict
 from collections.abc import Mapping
 from functools import wraps
 from operator import itemgetter
-from typing import Any, Callable, NamedTuple
+from typing import Any, Callable, NamedTuple, Optional
 from uuid import uuid4
 
 import torch
@@ -285,7 +285,9 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         else:
             return field_data[positions]
 
-    async def put_data(self, data: TensorDict, metadata: BatchMeta) -> None:
+    async def put_data(
+        self, data: TensorDict, metadata: BatchMeta, data_parser: Optional[Callable[[Any], Any]] = None
+    ) -> None:
         """
         Send data to remote StorageUnit based on metadata.
 
@@ -295,6 +297,15 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         Args:
             data: TensorDict containing the data to store.
             metadata: BatchMeta containing storage location information.
+            data_parser: Optional callable to parse reference data (e.g., URLs) into real
+                         content. The input is a plain dict (not TensorDict) mapping
+                         field_name -> batched values. For a regular tensor column the
+                         value is a batched tensor; for nested tensors (jagged or strided)
+                         and NonTensorStack columns the values are extracted into a list.
+                         It must modify values in-place based on the original keys; do not
+                         add or remove keys. The number of elements per column must also
+                         remain unchanged. Do not change the inner order of values within
+                         each column. Executed distributedly on each SimpleStorageUnit.
         """
 
         logger.debug(f"[{self.storage_manager_id}]: receive put_data request, putting {metadata.size} samples.")
@@ -312,6 +323,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
                 group.global_indexes,
                 {f: self._select_by_positions(data[f], group.batch_positions) for f in data.keys()},
                 target_storage_unit=su_id,
+                data_parser=data_parser,
             )
             for su_id, group in routing.items()
         ]
@@ -341,6 +353,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
         global_indexes: list[int],
         storage_data: dict[str, Any],
         target_storage_unit: str,
+        data_parser: Optional[Callable[[Any], Any]] = None,
         socket: zmq.Socket = None,
     ):
         """
@@ -351,7 +364,7 @@ class AsyncSimpleStorageManager(TransferQueueStorageManager):
             request_type=ZMQRequestType.PUT_DATA,  # type: ignore[arg-type]
             sender_id=self.storage_manager_id,
             receiver_id=target_storage_unit,
-            body={"global_indexes": global_indexes, "data": storage_data},
+            body={"global_indexes": global_indexes, "data": storage_data, "data_parser": data_parser},
         )
 
         try:
