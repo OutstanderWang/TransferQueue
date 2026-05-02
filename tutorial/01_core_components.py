@@ -143,7 +143,7 @@ def demonstrate_storage_backend_options():
     print("   - Leverage Ray's distributed object store to store data")
 
     print("5. Custom Storage Backends")
-    print("   - Implement your own storage manager by inheriting from `TransferQueueStorageManager` base class")
+    print("   - Implement your own storage manager by inheriting from `StorageManager` base class")
     print("   - For KV based storage, you only need to provide a storage client and integrate with `KVStorageManager`")
 
 

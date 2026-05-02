@@ -17,14 +17,14 @@ import os
 import time
 import weakref
 from threading import Event, Thread
-from typing import Any, Optional
+from typing import Any
 from uuid import uuid4
 
 import ray
 import zmq
 
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
-from transfer_queue.utils.enum_utils import TransferQueueRole
+from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
 from transfer_queue.utils.zmq_utils import (
@@ -34,7 +34,7 @@ from transfer_queue.utils.zmq_utils import (
     create_zmq_socket,
     format_zmq_address,
     get_free_port,
-    get_node_ip_address_raw,
+    get_node_ip_address,
 )
 
 logger = get_logger(__name__)
@@ -129,7 +129,7 @@ class SimpleStorageUnit:
     """A storage unit that provides distributed data storage functionality.
 
     This class represents a storage unit that can store data in a 2D structure
-    (samples × data fields) and provides ZMQ-based communication for put/get/clear operations.
+    (samples, data_fields) and provides ZMQ-based communication for put/get/clear operations.
 
     Note: We use Ray decorator (@ray.remote) only for initialization purposes.
     We do NOT use Ray's .remote() call capabilities - the storage unit runs
@@ -160,10 +160,10 @@ class SimpleStorageUnit:
         self._shutdown_event = Event()
 
         # Placeholder for zmq_context, proxy_thread and worker_threads
-        self.zmq_context: Optional[zmq.Context] = None
-        self.put_get_socket: Optional[zmq.Socket] = None
-        self.proxy_thread: Optional[Thread] = None
-        self.worker_thread: Optional[Thread] = None
+        self.zmq_context: zmq.Context | None = None
+        self.put_get_socket: zmq.Socket | None = None
+        self.proxy_thread: Thread | None = None
+        self.worker_thread: Thread | None = None
 
         self._init_zmq_socket()
         self._start_process_put_get()
@@ -186,7 +186,7 @@ class SimpleStorageUnit:
         - worker_socket (DEALER): Backend socket for worker communication.
         """
         self.zmq_context = zmq.Context()
-        self._node_ip = get_node_ip_address_raw()
+        self._node_ip = get_node_ip_address()
 
         # Frontend: ROUTER for receiving client requests
         self.put_get_socket = create_zmq_socket(self.zmq_context, zmq.ROUTER, self._node_ip)
@@ -205,7 +205,7 @@ class SimpleStorageUnit:
         self.worker_socket.bind(self._inproc_addr)
 
         self.zmq_server_info = ZMQServerInfo(
-            role=TransferQueueRole.STORAGE,
+            role=Role.STORAGE,
             id=str(self.storage_unit_id),
             ip=self._node_ip,
             ports={"put_get_socket": self._put_get_socket_port},
@@ -481,10 +481,10 @@ class SimpleStorageUnit:
     @staticmethod
     def _shutdown_resources(
         shutdown_event: Event,
-        worker_thread: Optional[Thread],
-        proxy_thread: Optional[Thread],
-        zmq_context: Optional[zmq.Context],
-        put_get_socket: Optional[zmq.Socket],
+        worker_thread: Thread | None,
+        proxy_thread: Thread | None,
+        zmq_context: zmq.Context | None,
+        put_get_socket: zmq.Socket | None,
     ) -> None:
         """Clean up resources on garbage collection."""
         logger.info("Shutting down SimpleStorageUnit resources...")

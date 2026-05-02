@@ -50,7 +50,7 @@ TransferQueue offers **fine-grained, sub-sample-level** data management and **lo
 
 ### Control Plane: Panoramic Data Management
 
-In the control plane, `TransferQueueController` tracks the **production status** and **consumption status** of each training sample as metadata. Once all required data fields are ready (i.e., written to the `TransferQueueStorageManager`), the data sample can be consumed by downstream tasks.
+In the control plane, `TransferQueueController` tracks the **production status** and **consumption status** of each training sample as metadata. Once all required data fields are ready (i.e., written to the `StorageManager`), the data sample can be consumed by downstream tasks.
 
 We also track the consumption history for each computational task (e.g., `generate_sequences`, `compute_log_prob`, etc.). Therefore, even when different computational tasks require the same data field, they can consume the data independently without interfering with each other.
 
@@ -66,7 +66,7 @@ To make the data retrieval process more customizable, we provide a `Sampler` cla
 
 In the data plane, we utilize a pluggable design, enabling TransferQueue to integrate with different storage backends based on user requirements.
 
-Specifically, we provide a `TransferQueueStorageManager` abstraction class that defines the core APIs as follows:
+Specifically, we provide a `StorageManager` abstraction class that defines the core APIs as follows:
 
 - `async def put_data(self, data: TensorDict, metadata: BatchMeta) -> None`
 - `async def get_data(self, metadata: BatchMeta) -> TensorDict`
@@ -298,21 +298,19 @@ The data plane is organized as follows:
   │   │── simple_backend.py             # Default distributed storage backend (SimpleStorageUnit) by TQ 
   │   ├── managers/                     # Managers are upper level interfaces that encapsulate the interaction logic with TQ system.
   │   │   ├── __init__.py
-  │   │   ├──base.py                    # TransferQueueStorageManager, KVStorageManager
-  │   │   ├──simple_backend_manager.py  # AsyncSimpleStorageManager
+  │   │   ├──base.py                    # StorageManager, KVStorageManager, StorageManagerFactory
+  │   │   ├──simple_storage_manager.py  # AsyncSimpleStorageManager
   │   │   ├──yuanrong_manager.py        # YuanrongStorageManager
-  │   │   ├──mooncake_manager.py        # MooncakeStorageManager
-  │   │   └──factory.py                 # TransferQueueStorageManagerFactory
+  │   │   └──mooncake_manager.py        # MooncakeStorageManager
   │   └── clients/                      # Clients are lower level interfaces that directly manipulate the target storage backend.
   │   │   ├── __init__.py
-  │   │   ├── base.py                   # TransferQueueStorageKVClient
+  │   │   ├── base.py                   # StorageKVClient, StorageClientFactory
   │   │   ├── yuanrong_client.py        # YuanrongStorageClient
   │   │   ├── mooncake_client.py        # MooncakeStorageClient
-  │   │   ├── ray_storage_client.py     # RayStorageClient
-  │   │   └── factory.py                # TransferQueueStorageClientFactory
+  │   │   └── ray_storage_client.py     # RayStorageClient
 ```
 
-To integrate TransferQueue with a custom storage backend, start by implementing a subclass that inherits from `TransferQueueStorageManager`. This subclass acts as an adapter between the TransferQueue system and the target storage backend. For KV-based storage backends, you can simply inherit from `KVStorageManager`, which can serve as the general manager for all KV-based backends.
+To integrate TransferQueue with a custom storage backend, start by implementing a subclass that inherits from `StorageManager`. This subclass acts as an adapter between the TransferQueue system and the target storage backend. For KV-based storage backends, you can simply inherit from `KVStorageManager`, which can serve as the general manager for all KV-based backends.
 
 Distributed storage backends often come with their own native clients serving as the interface of the storage system. In such cases, a low-level adapter for this client can be written, following the examples provided in the `storage/clients` directory.
 

@@ -19,7 +19,7 @@ from importlib.util import find_spec
 import pytest
 import torch
 
-from transfer_queue.storage.clients.factory import StorageClientFactory
+from transfer_queue.storage.clients.base import StorageClientFactory
 from transfer_queue.storage.clients.yuanrong_client import YuanrongStorageClient
 
 

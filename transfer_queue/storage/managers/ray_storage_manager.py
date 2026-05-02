@@ -15,12 +15,11 @@
 
 from typing import Any
 
-from transfer_queue.storage.managers.base import KVStorageManager
-from transfer_queue.storage.managers.factory import TransferQueueStorageManagerFactory
+from transfer_queue.storage.managers.base import KVStorageManager, StorageManagerFactory
 from transfer_queue.utils.zmq_utils import ZMQServerInfo
 
 
-@TransferQueueStorageManagerFactory.register("RayStore")
+@StorageManagerFactory.register("RayStore")
 class RayStorageManager(KVStorageManager):
     """Storage manager for Ray-RDT backend."""
 

@@ -24,7 +24,7 @@ from tensordict import NonTensorStack, TensorDict
 
 from transfer_queue.metadata import BatchMeta
 from transfer_queue.storage import AsyncSimpleStorageManager
-from transfer_queue.utils.enum_utils import TransferQueueRole
+from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo
 
 
@@ -35,13 +35,13 @@ async def mock_async_storage_manager():
     # Mock storage unit infos
     storage_unit_infos = {
         "storage_0": ZMQServerInfo(
-            role=TransferQueueRole.STORAGE,
+            role=Role.STORAGE,
             id="storage_0",
             ip="127.0.0.1",
             ports={"put_get_socket": 12345},
         ),
         "storage_1": ZMQServerInfo(
-            role=TransferQueueRole.STORAGE,
+            role=Role.STORAGE,
             id="storage_1",
             ip="127.0.0.1",
             ports={"put_get_socket": 12346},
@@ -50,7 +50,7 @@ async def mock_async_storage_manager():
 
     # Mock controller info
     controller_info = ZMQServerInfo(
-        role=TransferQueueRole.CONTROLLER,
+        role=Role.CONTROLLER,
         id="controller_0",
         ip="127.0.0.1",
         ports={"handshake_socket": 12347, "data_status_update_socket": 12348},
@@ -61,9 +61,7 @@ async def mock_async_storage_manager():
     }
 
     # Mock the handshake process entirely to avoid ZMQ complexity
-    with patch(
-        "transfer_queue.storage.managers.base.TransferQueueStorageManager._connect_to_controller"
-    ) as mock_connect:
+    with patch("transfer_queue.storage.managers.base.StorageManager._connect_to_controller") as mock_connect:
         # Mock the manager without actually connecting
         manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
         manager.storage_manager_id = "test_storage_manager"
@@ -148,7 +146,7 @@ async def test_async_storage_manager_error_handling():
     # Mock storage unit infos
     storage_unit_infos = {
         "storage_0": ZMQServerInfo(
-            role=TransferQueueRole.STORAGE,
+            role=Role.STORAGE,
             id="storage_0",
             ip="127.0.0.1",
             ports={"put_get_socket": 12345},
@@ -157,7 +155,7 @@ async def test_async_storage_manager_error_handling():
 
     # Mock controller info
     controller_info = ZMQServerInfo(
-        role=TransferQueueRole.CONTROLLER,
+        role=Role.CONTROLLER,
         id="controller_0",
         ip="127.0.0.1",
         ports={"handshake_socket": 12346, "data_status_update_socket": 12347},
@@ -242,19 +240,19 @@ async def test_get_data_routes_from_hash():
     """get_data should route using global_idx % num_su (hash routing)."""
     storage_unit_infos = {
         "storage_0": ZMQServerInfo(
-            role=TransferQueueRole.STORAGE,
+            role=Role.STORAGE,
             id="storage_0",
             ip="127.0.0.1",
             ports={"put_get_socket": 19010},
         ),
         "storage_1": ZMQServerInfo(
-            role=TransferQueueRole.STORAGE,
+            role=Role.STORAGE,
             id="storage_1",
             ip="127.0.0.1",
             ports={"put_get_socket": 19011},
         ),
     }
-    with patch("transfer_queue.storage.managers.base.TransferQueueStorageManager._connect_to_controller"):
+    with patch("transfer_queue.storage.managers.base.StorageManager._connect_to_controller"):
         manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
         manager.storage_manager_id = "test_get"
         manager.storage_unit_infos = storage_unit_infos
@@ -295,19 +293,19 @@ async def test_clear_data_routes_from_hash():
     """clear_data should route using global_idx % num_su (hash routing)."""
     storage_unit_infos = {
         "storage_0": ZMQServerInfo(
-            role=TransferQueueRole.STORAGE,
+            role=Role.STORAGE,
             id="storage_0",
             ip="127.0.0.1",
             ports={"put_get_socket": 19020},
         ),
         "storage_1": ZMQServerInfo(
-            role=TransferQueueRole.STORAGE,
+            role=Role.STORAGE,
             id="storage_1",
             ip="127.0.0.1",
             ports={"put_get_socket": 19021},
         ),
     }
-    with patch("transfer_queue.storage.managers.base.TransferQueueStorageManager._connect_to_controller"):
+    with patch("transfer_queue.storage.managers.base.StorageManager._connect_to_controller"):
         manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
         manager.storage_manager_id = "test_clear"
         manager.storage_unit_infos = storage_unit_infos
@@ -346,19 +344,19 @@ async def test_hash_routing_stable_across_batch_sizes():
     """
     storage_unit_infos = {
         "storage_0": ZMQServerInfo(
-            role=TransferQueueRole.STORAGE,
+            role=Role.STORAGE,
             id="storage_0",
             ip="127.0.0.1",
             ports={"put_get_socket": 19030},
         ),
         "storage_1": ZMQServerInfo(
-            role=TransferQueueRole.STORAGE,
+            role=Role.STORAGE,
             id="storage_1",
             ip="127.0.0.1",
             ports={"put_get_socket": 19031},
         ),
     }
-    with patch("transfer_queue.storage.managers.base.TransferQueueStorageManager._connect_to_controller"):
+    with patch("transfer_queue.storage.managers.base.StorageManager._connect_to_controller"):
         manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
         manager.storage_manager_id = "test_hash_batch"
         manager.storage_unit_infos = storage_unit_infos
@@ -407,19 +405,19 @@ async def test_hash_routing_stable_reversed_order():
     """
     storage_unit_infos = {
         "storage_0": ZMQServerInfo(
-            role=TransferQueueRole.STORAGE,
+            role=Role.STORAGE,
             id="storage_0",
             ip="127.0.0.1",
             ports={"put_get_socket": 19040},
         ),
         "storage_1": ZMQServerInfo(
-            role=TransferQueueRole.STORAGE,
+            role=Role.STORAGE,
             id="storage_1",
             ip="127.0.0.1",
             ports={"put_get_socket": 19041},
         ),
     }
-    with patch("transfer_queue.storage.managers.base.TransferQueueStorageManager._connect_to_controller"):
+    with patch("transfer_queue.storage.managers.base.StorageManager._connect_to_controller"):
         manager = AsyncSimpleStorageManager.__new__(AsyncSimpleStorageManager)
         manager.storage_manager_id = "test_hash_order"
         manager.storage_unit_infos = storage_unit_infos

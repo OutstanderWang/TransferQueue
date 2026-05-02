@@ -18,7 +18,7 @@ import os
 import subprocess
 import time
 from importlib import resources
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 from urllib.parse import urlparse
 
 import ray
@@ -32,7 +32,7 @@ from transfer_queue.controller import TransferQueueController
 from transfer_queue.metadata import KVBatchMeta
 from transfer_queue.sampler import *  # noqa: F401
 from transfer_queue.sampler import BaseSampler
-from transfer_queue.storage.simple_backend import SimpleStorageUnit
+from transfer_queue.storage.simple_storage import SimpleStorageUnit
 from transfer_queue.utils.common import get_placement_group
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.yuanrong_utils import (
@@ -43,40 +43,39 @@ from transfer_queue.utils.zmq_utils import process_zmq_server_info
 
 logger = get_logger(__name__)
 
-_TRANSFER_QUEUE_CLIENT: Any = None
-_TRANSFER_QUEUE_STORAGE: Any = None
-_TRANSFER_QUEUE_CONTROLLER: Any = None
+_TQ_CLIENT: Any = None
+_TQ_STORAGE: Any = None
+_TQ_CONTROLLER: Any = None
 
 
-def _maybe_create_transferqueue_client(
-    conf: Optional[DictConfig] = None,
-) -> TransferQueueClient:
-    global _TRANSFER_QUEUE_CLIENT
-    if _TRANSFER_QUEUE_CLIENT is None:
+def _maybe_create_tq_client(conf: DictConfig | None = None) -> TransferQueueClient:
+    global _TQ_CLIENT
+    if _TQ_CLIENT is None:
         if conf is None:
             _init_from_existing()
-            assert _TRANSFER_QUEUE_CLIENT is not None, (
+            assert _TQ_CLIENT is not None, (
                 "TransferQueueController has not been initialized yet. Please call init() first."
             )
-            return _TRANSFER_QUEUE_CLIENT
+            return _TQ_CLIENT
 
         pid = os.getpid()
-        _TRANSFER_QUEUE_CLIENT = TransferQueueClient(
+        _TQ_CLIENT = TransferQueueClient(
             client_id=f"TransferQueueClient_{pid}", controller_info=conf.controller.zmq_info
         )
 
         backend_name = conf.backend.storage_backend
 
-        _TRANSFER_QUEUE_CLIENT.initialize_storage_manager(manager_type=backend_name, config=conf.backend[backend_name])
+        _TQ_CLIENT.initialize_storage_manager(manager_type=backend_name, config=conf.backend[backend_name])
 
-    return _TRANSFER_QUEUE_CLIENT
+    return _TQ_CLIENT
 
 
-def _maybe_create_transferqueue_storage(conf: DictConfig) -> DictConfig:
-    global _TRANSFER_QUEUE_STORAGE
+# TODO(hz): Adopt registry pattern to manage storage backends for better scalability.
+def _maybe_create_tq_storage(conf: DictConfig) -> DictConfig:
+    global _TQ_STORAGE
 
-    if _TRANSFER_QUEUE_STORAGE is None:
-        _TRANSFER_QUEUE_STORAGE = {}
+    if _TQ_STORAGE is None:
+        _TQ_STORAGE = {}
         if conf.backend.storage_backend == "SimpleStorage":
             # initialize SimpleStorageUnit
             simple_storage_handles = {}
@@ -98,7 +97,7 @@ def _maybe_create_transferqueue_storage(conf: DictConfig) -> DictConfig:
             storage_zmq_info = process_zmq_server_info(simple_storage_handles)
             backend_name = conf.backend.storage_backend
             conf.backend[backend_name].zmq_info = storage_zmq_info
-            _TRANSFER_QUEUE_STORAGE["SimpleStorage"] = simple_storage_handles
+            _TQ_STORAGE["SimpleStorage"] = simple_storage_handles
         if conf.backend.storage_backend == "MooncakeStore":
             if conf.backend.MooncakeStore.auto_init:
                 # Try to kill existing mooncake_master processes before starting a new one to avoid potential conflicts
@@ -186,9 +185,9 @@ def _maybe_create_transferqueue_storage(conf: DictConfig) -> DictConfig:
                         f"mooncake_master exited with error. Check {log_file_path} for detailed logs. "
                         f"Output:\n{error_msg}"
                     )
-                _TRANSFER_QUEUE_STORAGE["MooncakeStore"] = process
+                _TQ_STORAGE["MooncakeStore"] = process
         if conf.backend.storage_backend == "Yuanrong" and conf.backend.Yuanrong.auto_init:
-            _TRANSFER_QUEUE_STORAGE["Yuanrong"] = initialize_yuanrong_backend(conf)
+            _TQ_STORAGE["Yuanrong"] = initialize_yuanrong_backend(conf)
     return conf
 
 
@@ -198,10 +197,10 @@ def _init_from_existing() -> bool:
     Returns:
         True if successfully initialized from existing controller, False otherwise.
     """
-    global _TRANSFER_QUEUE_CONTROLLER
+    global _TQ_CONTROLLER
     try:
-        if _TRANSFER_QUEUE_CONTROLLER is None:
-            _TRANSFER_QUEUE_CONTROLLER = ray.get_actor("TransferQueueController")
+        if _TQ_CONTROLLER is None:
+            _TQ_CONTROLLER = ray.get_actor("TransferQueueController")
 
     except ValueError:
         logger.info("Called _init_from_existing() but TransferQueueController has not been initialized yet.")
@@ -211,9 +210,9 @@ def _init_from_existing() -> bool:
 
     conf = None
     while conf is None:
-        conf = ray.get(_TRANSFER_QUEUE_CONTROLLER.get_config.remote())
+        conf = ray.get(_TQ_CONTROLLER.get_config.remote())
         if conf is not None:
-            _maybe_create_transferqueue_client(conf)
+            _maybe_create_tq_client(conf)
 
             logger.info("TransferQueueClient initialized.")
             return True
@@ -225,26 +224,21 @@ def _init_from_existing() -> bool:
 
 
 # ==================== Initialization API ====================
-def init(conf: Optional[DictConfig] = None) -> Optional[DictConfig]:
+def init(conf: DictConfig | None = None) -> DictConfig | None:
     """Initialize the TransferQueue system.
 
     This function sets up the TransferQueue controller, distributed storage, and client.
     It should be called once at the beginning of the program before any data operations.
 
-    If a controller already exists (e.g., initialized by another process), this function
-    will retrieve the config from existing controller and initialize the TransferQueueClient.
-    In this case, the `conf` parameter will be ignored.
+    If a controller already exists, reuse it and only initialize the client;
+    the provided `conf` will be ignored in this case.
 
     Args:
-        conf: Optional configuration dictionary. If provided, it will be merged with
-              the default config from 'config.yaml'. This is only used for first-time
-              initializing. When connecting to an existing controller, this parameter
-              is ignored.
+        conf: Optional custom config merged with default `config.yaml`.
+              Only takes effect on first-time initialization, ignored when attaching
+              to an existing controller.
     Returns:
         The merged configuration dictionary.
-
-    Raises:
-        ValueError: If config is not valid or required configuration keys are missing.
 
     Example:
         >>> # In process 0, node A
@@ -261,17 +255,15 @@ def init(conf: Optional[DictConfig] = None) -> Optional[DictConfig]:
     if _init_from_existing():
         return conf
 
-    # First-time initialize TransferQueue
     logger.info("No TransferQueueController found. Starting first-time initialization...")
 
-    # create config
     final_conf = OmegaConf.create({}, flags={"allow_objects": True})
     default_conf = OmegaConf.load(resources.files("transfer_queue") / "config.yaml")
     final_conf = OmegaConf.merge(final_conf, default_conf)
     if conf:
         final_conf = OmegaConf.merge(final_conf, conf)
 
-    # create controller
+    # TODO(hz): support load custom sampler class from external module.
     try:
         sampler = final_conf.controller.sampler
         if isinstance(sampler, BaseSampler):
@@ -288,9 +280,8 @@ def init(conf: Optional[DictConfig] = None) -> Optional[DictConfig]:
         raise ValueError(f"Could not find sampler {final_conf.controller.sampler}") from None
 
     try:
-        # Ray will make sure actor with same name can only be created once
-        global _TRANSFER_QUEUE_CONTROLLER
-        _TRANSFER_QUEUE_CONTROLLER = TransferQueueController.options(name="TransferQueueController").remote(  # type: ignore[attr-defined]
+        global _TQ_CONTROLLER
+        _TQ_CONTROLLER = TransferQueueController.options(name="TransferQueueController").remote(  # type: ignore[attr-defined]
             sampler=sampler, polling_mode=final_conf.controller.polling_mode
         )
         logger.info("TransferQueueController has been created.")
@@ -299,18 +290,15 @@ def init(conf: Optional[DictConfig] = None) -> Optional[DictConfig]:
         _init_from_existing()
         return final_conf
 
-    controller_zmq_info = process_zmq_server_info(_TRANSFER_QUEUE_CONTROLLER)
+    controller_zmq_info = process_zmq_server_info(_TQ_CONTROLLER)
     final_conf.controller.zmq_info = controller_zmq_info
 
-    # create distributed storage backends
-    final_conf = _maybe_create_transferqueue_storage(final_conf)
+    final_conf = _maybe_create_tq_storage(final_conf)
 
-    # store the config into controller
-    ray.get(_TRANSFER_QUEUE_CONTROLLER.store_config.remote(final_conf))
+    ray.get(_TQ_CONTROLLER.store_config.remote(final_conf))
     logger.info(f"TransferQueue config: {final_conf}")
 
-    # create client
-    _maybe_create_transferqueue_client(final_conf)
+    _maybe_create_tq_client(final_conf)
     return final_conf
 
 
@@ -325,13 +313,13 @@ def close():
     Note:
         This function should be called when the TransferQueue system is no longer needed.
     """
-    global _TRANSFER_QUEUE_CLIENT
-    global _TRANSFER_QUEUE_STORAGE
-    global _TRANSFER_QUEUE_CONTROLLER
+    global _TQ_CLIENT
+    global _TQ_STORAGE
+    global _TQ_CONTROLLER
 
     try:
-        if _TRANSFER_QUEUE_STORAGE:
-            for key, value in _TRANSFER_QUEUE_STORAGE.items():
+        if _TQ_STORAGE:
+            for key, value in _TQ_STORAGE.items():
                 if key == "SimpleStorage":
                     # only the process that do first-time init can clean the distributed storage
                     for storage in value.values():
@@ -345,9 +333,9 @@ def close():
                             f"Consider manually killing the mooncake_master."
                         )
 
-                    if _TRANSFER_QUEUE_CLIENT:
+                    if _TQ_CLIENT:
                         try:
-                            ret = _TRANSFER_QUEUE_CLIENT.storage_manager.storage_client._store.remove_all()
+                            ret = _TQ_CLIENT.storage_manager.storage_client._store.remove_all()
                             if ret < 0:
                                 logger.error("Failed to remove existing keys in mooncake_master.")
                             else:
@@ -357,37 +345,31 @@ def close():
                 elif key == "Yuanrong":
                     cleanup_yuanrong_resources(value)
                 else:
-                    logger.warning(f"close for _TRANSFER_QUEUE_STORAGE with key {key} is not supported for now.")
+                    logger.warning(f"close for _TQ_STORAGE with key {key} is not supported for now.")
 
-        _TRANSFER_QUEUE_STORAGE = None
+        _TQ_STORAGE = None
     except Exception:
         pass
 
-    if _TRANSFER_QUEUE_CLIENT:
-        _TRANSFER_QUEUE_CLIENT.close()
-        _TRANSFER_QUEUE_CLIENT = None
+    if _TQ_CLIENT:
+        _TQ_CLIENT.close()
+        _TQ_CLIENT = None
 
-    if _TRANSFER_QUEUE_CONTROLLER:
+    if _TQ_CONTROLLER:
         try:
-            ray.kill(_TRANSFER_QUEUE_CONTROLLER)
+            ray.kill(_TQ_CONTROLLER)
         except Exception:
             pass
-        _TRANSFER_QUEUE_CONTROLLER = None
-
-    try:
-        controller = ray.get_actor("TransferQueueController")
-        ray.kill(controller)
-    except Exception:
-        pass
+        _TQ_CONTROLLER = None
 
 
 # ==================== High-Level KV Interface API ====================
 def kv_put(
     key: str,
     partition_id: str,
-    fields: Optional[TensorDict | dict[str, Any]] = None,
-    tag: Optional[dict[str, Any]] = None,
-    data_parser: Optional[Callable[[Any], Any]] = None,
+    fields: TensorDict | dict[str, Any] | None = None,
+    tag: dict[str, Any] | None = None,
+    data_parser: Callable[[Any], Any] | None = None,
 ) -> KVBatchMeta:
     """Put a single key-value pair to TransferQueue.
 
@@ -440,7 +422,7 @@ def kv_put(
     if fields is None and tag is None:
         raise ValueError("Please provide at least one parameter of `fields` or `tag`.")
 
-    tq_client = _maybe_create_transferqueue_client()
+    tq_client = _maybe_create_tq_client()
 
     # 1. translate user-specified key to BatchMeta
     batch_meta = tq_client.kv_retrieve_meta(keys=[key], partition_id=partition_id, create=True)
@@ -488,41 +470,36 @@ def kv_put(
 def kv_batch_put(
     keys: list[str],
     partition_id: str,
-    fields: Optional[TensorDict] = None,
-    tags: Optional[list[dict[str, Any]]] = None,
-    data_parser: Optional[Callable[[Any], Any]] = None,
+    fields: TensorDict | None = None,
+    tags: list[dict[str, Any]] | None = None,
+    data_parser: Callable[[Any], Any] | None = None,
 ) -> KVBatchMeta:
-    """Put multiple key-value pairs to TransferQueue in batch.
+    """Batch put multiple key-value pairs into the TransferQueue.
 
-    This method stores multiple key-value pairs in a single operation, which is more
-    efficient than calling kv_put multiple times.
+    This method stores multiple key-value entries in a single operation,
+    which is significantly more efficient than repeated calls to ``kv_put``.
 
     Args:
-        keys: List of user-specified keys for the data
-        partition_id: Logical partition to store the data in
-        fields: TensorDict containing data for all keys. Must have batch_size == len(keys).
-                If not provided, will only update the newly given tags to the keys.
-        tags: List of metadata tags, one for each key
-        data_parser: Optional callable to parse reference data (e.g., URLs) into real
-                     content. The input is a slice of the `fields` parameter passed to
-                     kv_put / kv_batch_put, in plain dict format (not TensorDict),
-                     mapping field_name -> batched values. For a regular tensor column
-                     the value is a batched tensor; for nested tensors (jagged or
-                     strided) and NonTensorStack columns the values are extracted into
-                     a list. It must modify values in-place based on the original keys;
-                     do not add or remove keys. The number of elements per column must
-                     also remain unchanged. Do not change the inner order of values
-                     within each column. Only supported by SimpleStorage.
+        keys: List of user-defined unique keys for the data entries.
+        partition_id: Logical partition where the data will be stored.
+        fields: TensorDict containing batched data for all keys. Must have ``batch_size == len(keys)``.
+            If not provided, only the associated tags will be updated.
+        tags: List of metadata dictionaries, one per key.  Length must match the number of keys.
+        data_parser: Optional callable to parse raw reference data (e.g., URLs) into real content
+            before storage. The input is a plain dict (not TensorDict) mapping field names to
+            batched values. The parser  **must modify data in-place** without adding/removing
+            keys or changing element counts/order. Only supported by ``SimpleStorage`` backend.
 
     Returns:
-        KVBatchMeta: Metadata containing the keys, tags, partition_id, and fields.
-                     The `fields` attribute includes all fields stored for these samples,
-                     including any new fields written by this put operation.
+        KVBatchMeta: Metadata object containing stored keys, tags, partition ID,
+            and field information. The ``fields`` attribute includes all
+            persisted fields for the written samples.
 
     Raises:
-        ValueError: If neither `fields` nor `tags` is provided
-        ValueError: If length of `keys` doesn't match length of `tags` or the batch_size of `fields` TensorDict
-        RuntimeError: If retrieved BatchMeta size doesn't match length of `keys`
+        ValueError: When both ``fields`` and ``tags`` are empty.
+        ValueError: When ``fields`` batch size mismatches key count.
+        ValueError: When ``tags`` length mismatches key count.
+        RuntimeError: When retrieved metadata size mismatches input key count.
 
     Example:
         >>> import transfer_queue as tq
@@ -535,54 +512,42 @@ def kv_batch_put(
         ... }, batch_size=3)
         >>> tags = [{"score": 0.9}, {"score": 0.85}, {"score": 0.95}]
         >>> meta = tq.kv_batch_put(keys=keys, partition_id="train", fields=fields, tags=tags)
-        >>> print(meta.fields)  # ['input_ids', 'attention_mask']
+        >>> print(meta.fields)
     """
+    num_keys = len(keys)
 
     if fields is None and tags is None:
         raise ValueError("Please provide at least one parameter of fields or tag.")
 
-    if fields is not None and fields.batch_size[0] != len(keys):
-        raise ValueError(
-            f"`keys` with length {len(keys)} does not match the `fields` TensorDict with "
-            f"batch_size {fields.batch_size[0]}"
-        )
+    if fields is not None and fields.batch_size[0] != num_keys:
+        raise ValueError(f"Length of `keys` ({num_keys}) does not match `fields` batch size ({fields.batch_size[0]}).")
 
-    tq_client = _maybe_create_transferqueue_client()
-
-    # 1. translate user-specified key to BatchMeta
+    tq_client = _maybe_create_tq_client()
     batch_meta = tq_client.kv_retrieve_meta(keys=keys, partition_id=partition_id, create=True)
 
-    if batch_meta.size != len(keys):
-        raise RuntimeError(
-            f"Retrieved BatchMeta size {batch_meta.size} does not match with input `keys` size {len(keys)}!"
-        )
+    if batch_meta.size != num_keys:
+        raise RuntimeError(f"Retrieved BatchMeta size {batch_meta.size} does not match input `keys` size {num_keys}.")
 
-    # 2. register the user-specified tags to BatchMeta
     if tags is not None:
-        if len(tags) != len(keys):
-            raise ValueError(f"keys with length {len(keys)} does not match length of tags {len(tags)}")
+        if len(tags) != num_keys:
+            raise ValueError(f"Length of `keys` ({num_keys}) does not match length of `tags` ({len(tags)}).")
         batch_meta.update_custom_meta(tags)
 
-    # 3. put data
     if fields is not None:
-        # After put, batch_meta.field_names will include the new fields written by user
         batch_meta = tq_client.put(fields, batch_meta, data_parser=data_parser)
-    else:
-        # Directly update custom_meta (tags) to controller
+    else:  # tags is not None
         tq_client.set_custom_meta(batch_meta)
-
-    fields_to_return = batch_meta.field_names
 
     return KVBatchMeta(
         keys=keys,
         tags=batch_meta.custom_meta,
         partition_id=partition_id,
-        fields=fields_to_return,
+        fields=batch_meta.field_names,
         extra_info=batch_meta.extra_info,
     )
 
 
-def kv_batch_get_by_meta(meta: KVBatchMeta, select_fields: Optional[list[str] | str] = None) -> TensorDict:
+def kv_batch_get_by_meta(meta: KVBatchMeta, select_fields: list[str] | str | None = None) -> TensorDict:
     """Get data from TransferQueue using KVBatchMeta.
 
     This is a convenience method for retrieving data using KVBatchMeta returned
@@ -622,7 +587,7 @@ def kv_batch_get_by_meta(meta: KVBatchMeta, select_fields: Optional[list[str] | 
         raise ValueError("Must provide partition_id in the input KVBatchMeta.")
     if select_fields is not None:
         if isinstance(select_fields, str):
-            fields_to_fetch: Optional[list[str]] = [select_fields]
+            fields_to_fetch: list[str] | None = [select_fields]
         else:
             fields_to_fetch = select_fields
 
@@ -637,9 +602,7 @@ def kv_batch_get_by_meta(meta: KVBatchMeta, select_fields: Optional[list[str] | 
     return kv_batch_get(keys=meta.keys, partition_id=meta.partition_id, select_fields=fields_to_fetch)
 
 
-def kv_batch_get(
-    keys: list[str] | str, partition_id: str, select_fields: Optional[list[str] | str] = None
-) -> TensorDict:
+def kv_batch_get(keys: list[str] | str, partition_id: str, select_fields: list[str] | str | None = None) -> TensorDict:
     """Get data from TransferQueue using user-specified keys.
 
     This is a convenience method for retrieving data using keys instead of indexes.
@@ -668,7 +631,7 @@ def kv_batch_get(
         ...     select_fields="input_ids"
         ... )
     """
-    tq_client = _maybe_create_transferqueue_client()
+    tq_client = _maybe_create_tq_client()
 
     batch_meta = tq_client.kv_retrieve_meta(keys=keys, partition_id=partition_id, create=False)
 
@@ -690,7 +653,7 @@ def kv_batch_get(
     return data
 
 
-def kv_list(partition_id: Optional[str] = None) -> dict[str, dict[str, Any]]:
+def kv_list(partition_id: str | None = None) -> dict[str, dict[str, Any]]:
     """List all keys and their metadata in one or all partitions.
 
     Args:
@@ -724,7 +687,7 @@ def kv_list(partition_id: Optional[str] = None) -> dict[str, dict[str, Any]]:
         >>> for pid, keys in all_partitions.items():
         >>>     print(f"Partition: {pid}, Key count: {len(keys)}")
     """
-    tq_client = _maybe_create_transferqueue_client()
+    tq_client = _maybe_create_tq_client()
 
     partition_info = tq_client.kv_list(partition_id)
 
@@ -753,7 +716,7 @@ def kv_clear(keys: list[str] | str, partition_id: str) -> None:
     if isinstance(keys, str):
         keys = [keys]
 
-    tq_client = _maybe_create_transferqueue_client()
+    tq_client = _maybe_create_tq_client()
     batch_meta = tq_client.kv_retrieve_meta(keys=keys, partition_id=partition_id, create=False)
 
     if batch_meta.size > 0:
@@ -764,9 +727,9 @@ def kv_clear(keys: list[str] | str, partition_id: str) -> None:
 async def async_kv_put(
     key: str,
     partition_id: str,
-    fields: Optional[TensorDict | dict[str, Any]] = None,
-    tag: Optional[dict[str, Any]] = None,
-    data_parser: Optional[Callable[[Any], Any]] = None,
+    fields: TensorDict | dict[str, Any] | None = None,
+    tag: dict[str, Any] | None = None,
+    data_parser: Callable[[Any], Any] | None = None,
 ) -> KVBatchMeta:
     """Asynchronously put a single key-value pair to TransferQueue.
 
@@ -820,7 +783,7 @@ async def async_kv_put(
     if fields is None and tag is None:
         raise ValueError("Please provide at least one parameter of fields or tag.")
 
-    tq_client = _maybe_create_transferqueue_client()
+    tq_client = _maybe_create_tq_client()
 
     # 1. translate user-specified key to BatchMeta
     batch_meta = await tq_client.async_kv_retrieve_meta(keys=[key], partition_id=partition_id, create=True)
@@ -868,9 +831,9 @@ async def async_kv_put(
 async def async_kv_batch_put(
     keys: list[str],
     partition_id: str,
-    fields: Optional[TensorDict] = None,
-    tags: Optional[list[dict[str, Any]]] = None,
-    data_parser: Optional[Callable[[Any], Any]] = None,
+    fields: TensorDict | None = None,
+    tags: list[dict[str, Any]] | None = None,
+    data_parser: Callable[[Any], Any] | None = None,
 ) -> KVBatchMeta:
     """Asynchronously put multiple key-value pairs to TransferQueue in batch.
 
@@ -926,7 +889,7 @@ async def async_kv_batch_put(
             f"batch_size {fields.batch_size[0]}"
         )
 
-    tq_client = _maybe_create_transferqueue_client()
+    tq_client = _maybe_create_tq_client()
 
     # 1. translate user-specified key to BatchMeta
     batch_meta = await tq_client.async_kv_retrieve_meta(keys=keys, partition_id=partition_id, create=True)
@@ -961,7 +924,7 @@ async def async_kv_batch_put(
     )
 
 
-async def async_kv_batch_get_by_meta(meta: KVBatchMeta, select_fields: Optional[list[str] | str] = None) -> TensorDict:
+async def async_kv_batch_get_by_meta(meta: KVBatchMeta, select_fields: list[str] | str | None = None) -> TensorDict:
     """Asynchronously get data from TransferQueue using KVBatchMeta.
 
     This is a convenience method for retrieving data using KVBatchMeta returned
@@ -1019,7 +982,7 @@ async def async_kv_batch_get_by_meta(meta: KVBatchMeta, select_fields: Optional[
 
 
 async def async_kv_batch_get(
-    keys: list[str] | str, partition_id: str, select_fields: Optional[list[str] | str] = None
+    keys: list[str] | str, partition_id: str, select_fields: list[str] | str | None = None
 ) -> TensorDict:
     """Asynchronously get data from TransferQueue using user-specified keys.
 
@@ -1049,7 +1012,7 @@ async def async_kv_batch_get(
         ...     select_fields="input_ids"
         ... )
     """
-    tq_client = _maybe_create_transferqueue_client()
+    tq_client = _maybe_create_tq_client()
 
     batch_meta = await tq_client.async_kv_retrieve_meta(keys=keys, partition_id=partition_id, create=False)
 
@@ -1070,7 +1033,7 @@ async def async_kv_batch_get(
     return data
 
 
-async def async_kv_list(partition_id: Optional[str] = None) -> dict[str, dict[str, Any]]:
+async def async_kv_list(partition_id: str | None = None) -> dict[str, dict[str, Any]]:
     """Asynchronously list all keys and their metadata in one or all partitions.
 
     Args:
@@ -1105,7 +1068,7 @@ async def async_kv_list(partition_id: Optional[str] = None) -> dict[str, dict[st
         >>> for pid, keys in all_partitions.items():
         >>>     print(f"Partition: {pid}, Key count: {len(keys)}")
     """
-    tq_client = _maybe_create_transferqueue_client()
+    tq_client = _maybe_create_tq_client()
 
     partition_info = await tq_client.async_kv_list(partition_id)
 
@@ -1134,7 +1097,7 @@ async def async_kv_clear(keys: list[str] | str, partition_id: str) -> None:
     if isinstance(keys, str):
         keys = [keys]
 
-    tq_client = _maybe_create_transferqueue_client()
+    tq_client = _maybe_create_tq_client()
     batch_meta = await tq_client.async_kv_retrieve_meta(keys=keys, partition_id=partition_id, create=False)
 
     if batch_meta.size > 0:
@@ -1145,6 +1108,5 @@ async def async_kv_clear(keys: list[str] | str, partition_id: str) -> None:
 # For low-level API support, please refer to transfer_queue/client.py for details.
 def get_client():
     """Get a TransferQueueClient for using low-level API"""
-    if _TRANSFER_QUEUE_CLIENT is None:
-        raise RuntimeError("Please initialize the TransferQueue first by calling `tq.init()`!")
-    return _TRANSFER_QUEUE_CLIENT
+    assert _TQ_CLIENT is not None, "Please initialize the TransferQueue first by calling `tq.init()`!"
+    return _TQ_CLIENT

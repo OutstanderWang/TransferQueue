@@ -19,7 +19,7 @@ import itertools
 from collections import defaultdict
 from dataclasses import dataclass
 from types import MappingProxyType
-from typing import Any, Optional
+from typing import Any
 
 import numpy as np
 import torch
@@ -28,11 +28,6 @@ from tensordict import TensorDict
 from transfer_queue.utils.logging_utils import get_logger
 
 logger = get_logger(__name__)
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
 
 
 def _extra_info_values_equal(a: Any, b: Any) -> bool:
@@ -55,7 +50,7 @@ def _extra_info_values_equal(a: Any, b: Any) -> bool:
 class _SampleView:
     """Lazy read-only view of a single sample row in a columnar BatchMeta.
 
-    All returned dicts are ``MappingProxyType`` – attempts to mutate them
+    All returned dicts are ``MappingProxyType``, and attempts to mutate them
     raise ``TypeError``, making it obvious that this is a snapshot view.
     """
 
@@ -226,11 +221,11 @@ class BatchMeta:
         self,
         global_indexes: list[int],
         partition_ids: list[str],
-        field_schema: Optional[dict[str, dict[str, Any]]] = None,
-        production_status: Optional[np.ndarray] = None,
-        extra_info: Optional[dict[str, Any]] = None,
-        custom_meta: Optional[list[dict[str, Any]]] = None,
-        _custom_backend_meta: Optional[list[dict[str, Any]]] = None,
+        field_schema: dict[str, dict[str, Any]] | None = None,
+        production_status: np.ndarray | None = None,
+        extra_info: dict[str, Any] | None = None,
+        custom_meta: list[dict[str, Any]] | None = None,
+        _custom_backend_meta: list[dict[str, Any]] | None = None,
     ) -> None:
         if field_schema is None:
             field_schema = {}
@@ -379,7 +374,6 @@ class BatchMeta:
         return [meta.get("shape")] * self.size
 
     # ==================== Extra Info Methods ====================
-
     def get_extra_info(self, key: str, default: Any = None) -> Any:
         """Get extra info by key"""
         return self.extra_info.get(key, default)
@@ -417,7 +411,6 @@ class BatchMeta:
         return key in self.extra_info
 
     # ==================== Custom Meta Methods (User Layer) ====================
-
     def get_all_custom_meta(self) -> list[dict[str, Any]]:
         """Get all custom_meta as a list of dictionary (one per sample, in global_indexes order).
 
@@ -451,7 +444,6 @@ class BatchMeta:
         self.custom_meta = [{} for _ in range(self.size)]
 
     # ==================== Core BatchMeta Operations ====================
-
     def add_fields(self, tensor_dict: TensorDict, set_all_ready: bool = True) -> "BatchMeta":
         """Add new fields from a TensorDict to all samples in this batch.
         This modifies the batch in-place to include the new fields.
@@ -793,7 +785,7 @@ class BatchMeta:
         self._custom_backend_meta = [self._custom_backend_meta[i] for i in indices]
 
     @classmethod
-    def empty(cls, extra_info: Optional[dict[str, Any]] = None) -> "BatchMeta":
+    def empty(cls, extra_info: dict[str, Any] | None = None) -> "BatchMeta":
         """Create an empty BatchMeta with no samples.
 
         Args:
@@ -836,13 +828,13 @@ class KVBatchMeta:
     tags: list[dict] = dataclasses.field(default_factory=list)
 
     # [optional] partition_id of this batch
-    partition_id: Optional[str] = None
+    partition_id: str | None = None
 
     # [optional] fields of each sample
-    fields: Optional[list[str]] = None
+    fields: list[str] | None = None
 
     # [optional] external information for batch-level information
-    extra_info: Optional[dict[str, Any]] = dataclasses.field(default_factory=dict)
+    extra_info: dict[str, Any] | None = dataclasses.field(default_factory=dict)
 
     def __post_init__(self):
         """Validate all the variables"""

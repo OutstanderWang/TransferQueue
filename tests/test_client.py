@@ -24,7 +24,7 @@ from tensordict import NonTensorStack, TensorDict
 
 from transfer_queue import TransferQueueClient
 from transfer_queue.metadata import BatchMeta
-from transfer_queue.utils.enum_utils import TransferQueueRole
+from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
@@ -59,7 +59,7 @@ class MockController:
         self.request_port = self._bind_to_random_port(self.request_socket)
 
         self.zmq_server_info = ZMQServerInfo(
-            role=TransferQueueRole.CONTROLLER,
+            role=Role.CONTROLLER,
             id=controller_id,
             ip="127.0.0.1",
             ports={
@@ -300,7 +300,7 @@ class MockStorage:
         self.data_port = self._bind_to_random_port(self.data_socket)
 
         self.zmq_server_info = ZMQServerInfo(
-            role=TransferQueueRole.STORAGE,
+            role=Role.STORAGE,
             id=storage_id,
             ip="127.0.0.1",
             ports={
@@ -409,7 +409,7 @@ def client_setup(mock_controller, mock_storage):
 
     # Mock the storage manager to avoid handshake issues but mock all data operations
     with patch(
-        "transfer_queue.storage.managers.simple_backend_manager.AsyncSimpleStorageManager._connect_to_controller"
+        "transfer_queue.storage.managers.simple_storage_manager.AsyncSimpleStorageManager._connect_to_controller"
     ):
         config = {
             "controller_info": mock_controller.zmq_server_info,
@@ -502,7 +502,7 @@ def test_single_controller_multiple_storages():
 
         # Mock the storage manager to avoid handshake issues but mock all data operations
         with patch(
-            "transfer_queue.storage.managers.simple_backend_manager.AsyncSimpleStorageManager._connect_to_controller"
+            "transfer_queue.storage.managers.simple_storage_manager.AsyncSimpleStorageManager._connect_to_controller"
         ):
             config = {
                 "controller_info": controller.zmq_server_info,

@@ -15,15 +15,14 @@
 
 from typing import Any
 
-from transfer_queue.storage.managers.base import KVStorageManager
-from transfer_queue.storage.managers.factory import TransferQueueStorageManagerFactory
+from transfer_queue.storage.managers.base import KVStorageManager, StorageManagerFactory
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import ZMQServerInfo
 
 logger = get_logger(__name__)
 
 
-@TransferQueueStorageManagerFactory.register("Yuanrong")
+@StorageManagerFactory.register("Yuanrong")
 class YuanrongStorageManager(KVStorageManager):
     """Storage manager for Yuanrong backend."""
 

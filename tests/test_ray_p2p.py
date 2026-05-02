@@ -23,8 +23,7 @@ from tensordict import TensorDict
 
 from transfer_queue.client import TransferQueueClient
 from transfer_queue.metadata import BatchMeta
-from transfer_queue.storage.managers.base import KVStorageManager
-from transfer_queue.storage.managers.factory import TransferQueueStorageManagerFactory
+from transfer_queue.storage.managers.base import KVStorageManager, StorageManagerFactory
 from transfer_queue.utils.zmq_utils import ZMQServerInfo
 
 TEST_CONFIGS: list[tuple[tuple[int, int], torch.dtype]] = [
@@ -45,18 +44,18 @@ TEST_CONFIGS: list[tuple[tuple[int, int], torch.dtype]] = [
 
 # Step 1: Mock Controller Role
 try:
-    from transfer_queue.role import TransferQueueRole
+    from transfer_queue.role import Role
 except ImportError:
     from enum import Enum
 
-    class TransferQueueRole(Enum):
+    class Role(Enum):
         CONTROLLER = "controller"
         STORAGE = "storage"
 
 
 def create_mock_controller():
     return ZMQServerInfo(
-        role=TransferQueueRole.CONTROLLER,
+        role=Role.CONTROLLER,
         id="controller_0",
         ip="127.0.0.1",
         ports={
@@ -71,9 +70,9 @@ def create_mock_controller():
 def ensure_mock_storage_manager_registered():
     """Ensure MockKVStorageManager is registered in current process."""
 
-    if "KV_MOCK" not in TransferQueueStorageManagerFactory._registry:
+    if "KV_MOCK" not in StorageManagerFactory._registry:
 
-        @TransferQueueStorageManagerFactory.register("KV_MOCK")
+        @StorageManagerFactory.register("KV_MOCK")
         class MockKVStorageManager(KVStorageManager):
             def _connect_to_controller(self):
                 pass

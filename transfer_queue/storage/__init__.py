@@ -17,17 +17,17 @@ from .managers import (
     AsyncSimpleStorageManager,
     MooncakeStorageManager,
     RayStorageManager,
-    TransferQueueStorageManager,
-    TransferQueueStorageManagerFactory,
+    StorageManager,
+    StorageManagerFactory,
     YuanrongStorageManager,
 )
-from .simple_backend import SimpleStorageUnit, StorageUnitData
+from .simple_storage import SimpleStorageUnit, StorageUnitData
 
 __all__ = [
     "SimpleStorageUnit",
     "StorageUnitData",
-    "TransferQueueStorageManager",
-    "TransferQueueStorageManagerFactory",
+    "StorageManager",
+    "StorageManagerFactory",
     "AsyncSimpleStorageManager",
     "MooncakeStorageManager",
     "YuanrongStorageManager",

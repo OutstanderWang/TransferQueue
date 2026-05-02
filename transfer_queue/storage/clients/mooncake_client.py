@@ -15,13 +15,12 @@
 
 import pickle
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Any, Optional
+from typing import Any
 
 import torch
 from torch import Tensor
 
-from transfer_queue.storage.clients.base import TransferQueueStorageKVClient
-from transfer_queue.storage.clients.factory import StorageClientFactory
+from transfer_queue.storage.clients.base import StorageClientFactory, StorageKVClient
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.tensor_utils import allocate_empty_tensors, get_nbytes, merge_contiguous_memory
 
@@ -39,7 +38,7 @@ MAX_WORKER_THREADS = 4
 
 
 @StorageClientFactory.register("MooncakeStoreClient")
-class MooncakeStoreClient(TransferQueueStorageKVClient):
+class MooncakeStoreClient(StorageKVClient):
     """
     Storage client for MooncakeStore.
     """
@@ -64,9 +63,9 @@ class MooncakeStoreClient(TransferQueueStorageKVClient):
             self.device_name = ""
 
         if self.local_hostname is None or self.local_hostname == "":
-            from transfer_queue.utils.zmq_utils import get_node_ip_address_raw
+            from transfer_queue.utils.zmq_utils import get_node_ip_address
 
-            ip = get_node_ip_address_raw()
+            ip = get_node_ip_address()
             logger.info(f"Try to use Ray IP ({ip}) as local hostname for MooncakeStore.")
             self.local_hostname = ip
 
@@ -169,9 +168,9 @@ class MooncakeStoreClient(TransferQueueStorageKVClient):
     def get(
         self,
         keys: list[str],
-        shapes: Optional[list[Any]] = None,
-        dtypes: Optional[list[Any]] = None,
-        custom_backend_meta: Optional[list[str]] = None,
+        shapes: list[Any] | None = None,
+        dtypes: list[Any] | None = None,
+        custom_backend_meta: list[str] | None = None,
     ) -> list[Any]:
         """Get multiple key-value pairs from MooncakeStore.
 
@@ -259,7 +258,7 @@ class MooncakeStoreClient(TransferQueueStorageKVClient):
 
         return results, indexes
 
-    def clear(self, keys: list[str], custom_backend_meta: Optional[list[Any]] = None) -> None:
+    def clear(self, keys: list[str], custom_backend_meta: list[Any] | None = None) -> None:
         """Deletes multiple keys from MooncakeStore.
 
         Args:

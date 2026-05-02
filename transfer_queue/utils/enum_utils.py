@@ -32,7 +32,7 @@ class ExplicitEnum(str, Enum):
         )
 
 
-class TransferQueueRole(ExplicitEnum):
+class Role(ExplicitEnum):
     """Available Roles of TransferQueue."""
 
     CONTROLLER = "TransferQueueController"

@@ -13,16 +13,15 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from .base import TransferQueueStorageManager
-from .factory import TransferQueueStorageManagerFactory
+from .base import StorageManager, StorageManagerFactory
 from .mooncake_manager import MooncakeStorageManager
 from .ray_storage_manager import RayStorageManager
-from .simple_backend_manager import AsyncSimpleStorageManager
+from .simple_storage_manager import AsyncSimpleStorageManager
 from .yuanrong_manager import YuanrongStorageManager
 
 __all__ = [
-    "TransferQueueStorageManager",
-    "TransferQueueStorageManagerFactory",
+    "StorageManager",
+    "StorageManagerFactory",
     "AsyncSimpleStorageManager",
     "YuanrongStorageManager",
     "MooncakeStorageManager",

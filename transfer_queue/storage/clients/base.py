@@ -14,10 +14,10 @@
 # limitations under the License.
 
 from abc import ABC, abstractmethod
-from typing import Any, Optional
+from typing import Any
 
 
-class TransferQueueStorageKVClient(ABC):
+class StorageKVClient(ABC):
     """
     Abstract base class for storage client.
     Subclasses must implement the core methods: put, get, and clear.
@@ -32,7 +32,7 @@ class TransferQueueStorageKVClient(ABC):
         self.config = config
 
     @abstractmethod
-    def put(self, keys: list[str], values: list[Any]) -> Optional[list[Any]]:
+    def put(self, keys: list[str], values: list[Any]) -> list[Any] | None:
         """
         Store key-value pairs in the storage backend.
         Args:
@@ -68,3 +68,44 @@ class TransferQueueStorageKVClient(ABC):
     def clear(self, keys: list[str], custom_backend_meta=None) -> None:
         """Clear key-value pairs in the storage backend."""
         raise NotImplementedError("Subclasses must implement clear")
+
+
+class StorageClientFactory:
+    """
+    Factory class for creating storage client instances.
+    Uses a decorator-based registration mechanism to map client names to classes.
+    """
+
+    # Class variable: maps client names to their corresponding classes
+    _registry: dict[str, type[StorageKVClient]] = {}
+
+    @classmethod
+    def register(cls, client_type: str):
+        """
+        Decorator to register a concrete client class with the factory.
+        Args:
+            client_type (str): The name used to identify the client
+        Returns:
+            Callable: The decorator function that returns the original class
+        """
+
+        def decorator(client_class: type[StorageKVClient]) -> type[StorageKVClient]:
+            cls._registry[client_type] = client_class
+            return client_class
+
+        return decorator
+
+    @classmethod
+    def create(cls, client_type: str, config: dict) -> StorageKVClient:
+        """
+        Create and return an instance of the storage client by name.
+        Args:
+            client_type (str): The registered name of the client
+        Returns:
+            StorageClientFactory: An instance of the requested client
+        Raises:
+            ValueError: If no client is registered with the given name
+        """
+        if client_type not in cls._registry:
+            raise ValueError(f"Unknown StorageClient: {client_type}")
+        return cls._registry[client_type](config)

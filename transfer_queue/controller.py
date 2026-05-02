@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from itertools import groupby
 from operator import itemgetter
 from threading import Lock, Thread
-from typing import Any, Optional
+from typing import Any
 from uuid import uuid4
 
 import numpy as np
@@ -35,7 +35,7 @@ from transfer_queue.metadata import (
     BatchMeta,
 )
 from transfer_queue.sampler import BaseSampler, SequentialSampler
-from transfer_queue.utils.enum_utils import TransferQueueRole
+from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
 from transfer_queue.utils.zmq_utils import (
@@ -45,7 +45,7 @@ from transfer_queue.utils.zmq_utils import (
     create_zmq_socket,
     format_zmq_address,
     get_free_port,
-    get_node_ip_address_raw,
+    get_node_ip_address,
 )
 
 logger = get_logger(__name__)
@@ -195,10 +195,10 @@ class FieldMeta:
     """
 
     global_indexes: set[int] = field(default_factory=set)
-    dtype: Optional[Any] = None
-    shape: Optional[tuple] = None  # None when is_nested=True
-    is_nested: Optional[bool] = None
-    is_non_tensor: Optional[bool] = None
+    dtype: Any | None = None
+    shape: tuple | None = None  # None when is_nested=True
+    is_nested: bool | None = None
+    is_non_tensor: bool | None = None
 
     per_sample_shapes: dict[int, tuple] = field(default_factory=dict)  # {global_idx: shape}
 
@@ -384,7 +384,6 @@ class DataPartitionStatus:
         return self.production_status.shape[0]
 
     # ==================== Index Pre-Allocation Methods ====================
-
     def register_pre_allocated_indexes(self, allocated_indexes: list[int]):
         """
         Register pre-allocated sample indexes to this partition.
@@ -442,7 +441,6 @@ class DataPartitionStatus:
         return global_index_to_allocate
 
     # ==================== Dynamic Expansion Methods ====================
-
     def ensure_samples_capacity(self, required_samples: int) -> None:
         """
         Ensure the production status tensor has enough rows for the required samples.
@@ -492,13 +490,12 @@ class DataPartitionStatus:
             logger.debug(f"Expanded partition {self.partition_id} from {current_fields} to {new_fields} fields")
 
     # ==================== Production Status Interface ====================
-
     def update_production_status(
         self,
         global_indices: list[int],
         field_names: list[str],
         field_schema: dict[str, dict[str, Any]],
-        custom_backend_meta: Optional[dict[int, dict[str, Any]]] = None,
+        custom_backend_meta: dict[int, dict[str, Any]] | None = None,
     ) -> bool:
         """
         Update production status for specific samples and fields.
@@ -563,7 +560,7 @@ class DataPartitionStatus:
         self,
         global_indexes: list[int],
         field_schema: dict[str, dict[str, Any]],
-        custom_backend_meta: Optional[dict[int, dict[str, Any]]] = None,
+        custom_backend_meta: dict[int, dict[str, Any]] | None = None,
     ):
         """Update field metadata from columnar field_schema."""
         if not global_indexes:
@@ -611,7 +608,6 @@ class DataPartitionStatus:
             )
 
     # ==================== Consumption Status Interface ====================
-
     def get_consumption_status(self, task_name: str, mask: bool = False) -> tuple[Tensor, Tensor]:
         """
         Get or create consumption status for a specific task.
@@ -649,7 +645,7 @@ class DataPartitionStatus:
             consumption_status = self.consumption_status[task_name]
         return partition_global_index, consumption_status
 
-    def reset_consumption(self, task_name: Optional[str] = None):
+    def reset_consumption(self, task_name: str | None = None):
         """
         Reset consumption status for a specific task or all tasks.
 
@@ -674,7 +670,7 @@ class DataPartitionStatus:
     # ==================== Production Status Interface ====================
     def get_production_status_for_fields(
         self, field_names: list[str], mask: bool = False
-    ) -> tuple[Optional[Tensor], Optional[Tensor]]:
+    ) -> tuple[Tensor | None, Tensor | None]:
         """
         Check if all samples for specified fields are fully produced and ready.
 
@@ -713,7 +709,6 @@ class DataPartitionStatus:
         return partition_global_index, production_status
 
     # ==================== Data Scanning and Query Methods ====================
-
     def scan_data_status(self, field_names: list[str], task_name: str) -> list[int]:
         """
         Scan data status to find samples ready for consumption.
@@ -761,7 +756,6 @@ class DataPartitionStatus:
         return ready_sample_indices
 
     # ==================== Metadata Methods ====================
-
     def get_field_schema(
         self, field_names: list[str], batch_global_indexes: list[int] | None = None
     ) -> dict[str, dict[str, Any]]:
@@ -830,7 +824,6 @@ class DataPartitionStatus:
         self.custom_meta.update(custom_meta)
 
     # ==================== Statistics and Monitoring ====================
-
     def get_statistics(self) -> dict[str, Any]:
         """Get detailed statistics for this partition."""
         stats = {
@@ -877,7 +870,6 @@ class DataPartitionStatus:
         return stats
 
     # ==================== Serialization ====================
-
     def to_snapshot(self):
         """
         Get a snapshot of partition status information.
@@ -1028,7 +1020,6 @@ class TransferQueueController:
         logger.info(f"TransferQueue Controller {self.controller_id} initialized")
 
     # ==================== Partition Management API ====================
-
     def create_partition(self, partition_id: str) -> bool:
         """
         Create a new data partition with pre-allocated sample indexes.
@@ -1058,7 +1049,7 @@ class TransferQueueController:
         logger.info(f"Created partition {partition_id} with {TQ_PRE_ALLOC_SAMPLE_NUM} pre-allocated indexes")
         return True
 
-    def _get_partition(self, partition_id: str) -> Optional[DataPartitionStatus]:
+    def _get_partition(self, partition_id: str) -> DataPartitionStatus | None:
         """
         Get partition status information.
 
@@ -1070,7 +1061,7 @@ class TransferQueueController:
         """
         return self.partitions.get(partition_id)
 
-    def get_partition_snapshot(self, partition_id: str) -> Optional[DataPartitionStatus]:
+    def get_partition_snapshot(self, partition_id: str) -> DataPartitionStatus | None:
         """
         Get a copy of partition status information, without threading.Lock().
 
@@ -1098,7 +1089,6 @@ class TransferQueueController:
         return list(self.partitions.keys())
 
     # ==================== Partition Index Management API ====================
-
     def get_partition_index_range(self, partition_id: str) -> list[int]:
         """
         Get all indexes for a specific partition.
@@ -1114,13 +1104,12 @@ class TransferQueueController:
         return self.index_manager.get_indexes_for_partition(partition_id)
 
     # ==================== Data Production API ====================
-
     def update_production_status(
         self,
         partition_id: str,
         global_indexes: list[int],
         field_schema: dict[str, dict[str, Any]],
-        custom_backend_meta: Optional[dict[int, dict[str, Any]]] = None,
+        custom_backend_meta: dict[int, dict[str, Any]] | None = None,
     ) -> bool:
         """
         Update production status for specific samples and fields in a partition.
@@ -1150,8 +1139,7 @@ class TransferQueueController:
         return success
 
     # ==================== Data Consumption API ====================
-
-    def get_consumption_status(self, partition_id: str, task_name: str) -> tuple[Optional[Tensor], Optional[Tensor]]:
+    def get_consumption_status(self, partition_id: str, task_name: str) -> tuple[Tensor | None, Tensor | None]:
         """
         Get or create consumption status for a specific task and partition.
         Delegates to the partition's own method.
@@ -1171,9 +1159,7 @@ class TransferQueueController:
 
         return partition.get_consumption_status(task_name, mask=True)
 
-    def get_production_status(
-        self, partition_id: str, data_fields: list[str]
-    ) -> tuple[Optional[Tensor], Optional[Tensor]]:
+    def get_production_status(self, partition_id: str, data_fields: list[str]) -> tuple[Tensor | None, Tensor | None]:
         """
         Check if all samples for specified fields are fully produced in a partition.
 
@@ -1238,7 +1224,7 @@ class TransferQueueController:
         mode: str = "fetch",
         task_name: str | None = None,
         batch_size: int | None = None,
-        sampling_config: Optional[dict[str, Any]] = None,
+        sampling_config: dict[str, Any] | None = None,
         *args,
         **kwargs,
     ) -> BatchMeta:
@@ -1398,7 +1384,6 @@ class TransferQueueController:
         return ready_sample_indices
 
     # ==================== Metadata Generation API ====================
-
     def generate_batch_meta(
         self,
         partition_id: str,
@@ -1507,7 +1492,7 @@ class TransferQueueController:
         self.partitions.pop(partition_id)
         self.sampler.clear_cache(partition_id)
 
-    def reset_consumption(self, partition_id: str, task_name: Optional[str] = None):
+    def reset_consumption(self, partition_id: str, task_name: str | None = None):
         """
         Reset consumption status for a partition without clearing the actual data.
 
@@ -1592,17 +1577,17 @@ class TransferQueueController:
             metadata: BatchMeta of the requested keys
         """
 
-        logger.debug(f"[{self.controller_id}]: Retrieve keys {keys} in partition {partition_id}")
+        logger.debug(f"[{self.controller_id}] Retrieve keys {keys} in partition {partition_id}")
 
+        # Ensure partition exists
         partition = self._get_partition(partition_id)
-
         if partition is None:
             if not create:
-                logger.warning(f"Partition {partition_id} were not found in controller!")
+                logger.warning(f"Partition {partition_id} not found!")
                 return BatchMeta.empty()
-            else:
-                self.create_partition(partition_id)
-                partition = self._get_partition(partition_id)
+
+            self.create_partition(partition_id)
+            partition = self._get_partition(partition_id)
 
         assert partition is not None
         global_indexes = partition.kv_retrieve_indexes(keys)
@@ -1646,15 +1631,13 @@ class TransferQueueController:
             if col_idx < len(col_mask) and col_mask[col_idx]:
                 data_fields.append(field_name)
 
-        metadata = self.generate_batch_meta(partition_id, verified_global_indexes, data_fields, mode="force_fetch")
-
-        return metadata
+        return self.generate_batch_meta(partition_id, verified_global_indexes, data_fields, mode="force_fetch")
 
     def kv_retrieve_keys(
         self,
         global_indexes: list[int],
         partition_id: str,
-    ) -> list[Optional[str]]:
+    ) -> list[str | None]:
         """
         Retrieve keys from the controller using a list of global_indexes.
 
@@ -1689,7 +1672,7 @@ class TransferQueueController:
     def _init_zmq_socket(self):
         """Initialize ZMQ sockets for communication."""
         self.zmq_context = zmq.Context()
-        self._node_ip = get_node_ip_address_raw()
+        self._node_ip = get_node_ip_address()
 
         while True:
             try:
@@ -1726,7 +1709,7 @@ class TransferQueueController:
                 continue
 
         self.zmq_server_info = ZMQServerInfo(
-            role=TransferQueueRole.CONTROLLER,
+            role=Role.CONTROLLER,
             id=self.controller_id,
             ip=self._node_ip,
             ports={

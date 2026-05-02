@@ -20,7 +20,7 @@ import time
 import weakref
 from abc import ABC, abstractmethod
 from concurrent.futures import ThreadPoolExecutor
-from typing import Any, Callable, Optional
+from typing import Any, Callable
 from uuid import uuid4
 
 import ray
@@ -32,7 +32,7 @@ from tensordict import NonTensorStack, TensorDict
 from torch import Tensor
 
 from transfer_queue.metadata import BatchMeta, extract_field_schema
-from transfer_queue.storage.clients.factory import StorageClientFactory
+from transfer_queue.storage.clients.base import StorageClientFactory
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo, create_zmq_socket
 
@@ -49,7 +49,7 @@ LIMIT_THREADS_PER_MANAGER_IN_DRIVER = 8
 LIMIT_THREADS_PER_MANAGER_IN_RAY_ACTOR = 4
 
 
-class TransferQueueStorageManager(ABC):
+class StorageManager(ABC):
     """Base class for storage layer. It defines the interface for data operations and
     generally provides handshake & notification capabilities."""
 
@@ -59,9 +59,9 @@ class TransferQueueStorageManager(ABC):
         self.controller_info = controller_info
 
         # Handshake socket is sync (used only during initialization)
-        self.controller_handshake_socket: Optional[zmq.Socket] = None
+        self.controller_handshake_socket: zmq.Socket | None = None
 
-        self.zmq_context: Optional[zmq.asyncio.Context] = None
+        self.zmq_context: zmq.asyncio.Context | None = None
         self._connect_to_controller()
 
     def _connect_to_controller(self) -> None:
@@ -189,7 +189,7 @@ class TransferQueueStorageManager(ABC):
         partition_id: str,
         global_indexes: list[int],
         field_schema: dict[str, dict[str, Any]],
-        custom_backend_meta: Optional[dict[int, dict[str, Any]]] = None,
+        custom_backend_meta: dict[int, dict[str, Any]] | None = None,
     ) -> None:
         """
         Notify controller that new data is ready.
@@ -300,7 +300,7 @@ class TransferQueueStorageManager(ABC):
 
     @abstractmethod
     async def put_data(
-        self, data: TensorDict, metadata: BatchMeta, data_parser: Optional[Callable[[Any], Any]] = None
+        self, data: TensorDict, metadata: BatchMeta, data_parser: Callable[[Any], Any] | None = None
     ) -> None:
         """
         Put data into the storage backend.
@@ -364,11 +364,36 @@ class TransferQueueStorageManager(ABC):
             logger.error(f"[{self.storage_manager_id}]: Exception during __del__: {str(e)}")
 
 
-from transfer_queue.storage.managers.factory import TransferQueueStorageManagerFactory  # noqa: E402
+class StorageManagerFactory:
+    """Factory that creates a StorageManager instance."""
+
+    _registry: dict[str, type[StorageManager]] = {}
+
+    @classmethod
+    def register(cls, manager_type: str):
+        """Register a StorageManager class."""
+
+        def decorator(manager_cls: type[StorageManager]):
+            if not issubclass(manager_cls, StorageManager):
+                raise TypeError(
+                    f"manager_cls {getattr(manager_cls, '__name__', repr(manager_cls))} must be "
+                    f"a subclass of StorageManager"
+                )
+            cls._registry[manager_type] = manager_cls
+            return manager_cls
+
+        return decorator
+
+    @classmethod
+    def create(cls, manager_type: str, controller_info: ZMQServerInfo, config: dict[str, Any]) -> StorageManager:
+        """Create and return a StorageManager instance."""
+        assert manager_type in cls._registry, (
+            f"Unknown manager_type: {manager_type}. Supported managers include: {list(cls._registry.keys())}"
+        )
+        return cls._registry[manager_type](controller_info, config)
 
 
-@TransferQueueStorageManagerFactory.register("KVStorageManager")
-class KVStorageManager(TransferQueueStorageManager):
+class KVStorageManager(StorageManager):
     """
     A storage manager that uses a key-value (KV) backend (e.g., YuanRong) to store and retrieve tensor data.
     It maps structured metadata (BatchMeta) to flat lists of keys and values for efficient KV operations.
@@ -383,7 +408,7 @@ class KVStorageManager(TransferQueueStorageManager):
             raise ValueError("Missing client_name in config")
         super().__init__(controller_info, config)
         self.storage_client = StorageClientFactory.create(client_name, config)
-        self._multi_threads_executor: Optional[ThreadPoolExecutor] = None
+        self._multi_threads_executor: ThreadPoolExecutor | None = None
         self._executor_finalizer = weakref.finalize(self, self._shutdown_executor, self._multi_threads_executor)
 
     @staticmethod
@@ -428,7 +453,7 @@ class KVStorageManager(TransferQueueStorageManager):
         return results
 
     @staticmethod
-    def _shutdown_executor(thread_executor: Optional[ThreadPoolExecutor]) -> None:
+    def _shutdown_executor(thread_executor: ThreadPoolExecutor | None) -> None:
         """
         A static method to ensure no strong reference to 'self' is held within the
         finalizer's callback, enabling proper garbage collection.
@@ -569,7 +594,7 @@ class KVStorageManager(TransferQueueStorageManager):
         return shapes, dtypes, custom_backend_meta_list
 
     async def put_data(
-        self, data: TensorDict, metadata: BatchMeta, data_parser: Optional[Callable[[Any], Any]] = None
+        self, data: TensorDict, metadata: BatchMeta, data_parser: Callable[[Any], Any] | None = None
     ) -> None:
         """
         Store tensor data in the backend storage and notify the controller.

@@ -27,8 +27,7 @@ from omegaconf import DictConfig
 from tensordict import NonTensorStack, TensorDict
 
 from transfer_queue.metadata import BatchMeta, extract_field_schema
-from transfer_queue.storage.managers.base import TransferQueueStorageManager
-from transfer_queue.storage.managers.factory import TransferQueueStorageManagerFactory
+from transfer_queue.storage.managers.base import StorageManager, StorageManagerFactory
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
@@ -58,8 +57,8 @@ class RoutingGroup(NamedTuple):
     batch_positions: list[int]  # corresponding positions in the original batch
 
 
-@TransferQueueStorageManagerFactory.register("SimpleStorage")
-class AsyncSimpleStorageManager(TransferQueueStorageManager):
+@StorageManagerFactory.register("SimpleStorage")
+class AsyncSimpleStorageManager(StorageManager):
     """Asynchronous storage manager that handles multiple storage units.
 
     This manager provides async put/get/clear operations across multiple SimpleStorageUnit

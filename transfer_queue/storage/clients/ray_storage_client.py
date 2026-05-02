@@ -14,13 +14,12 @@
 # limitations under the License.
 
 import itertools
-from typing import Any, Optional
+from typing import Any
 
 import ray
 import torch
 
-from transfer_queue.storage.clients.base import TransferQueueStorageKVClient
-from transfer_queue.storage.clients.factory import StorageClientFactory
+from transfer_queue.storage.clients.base import StorageClientFactory, StorageKVClient
 
 
 @ray.remote(max_concurrency=8)
@@ -47,7 +46,7 @@ class RayObjectRefStorage:
 
 
 @StorageClientFactory.register("RayStorageClient")
-class RayStorageClient(TransferQueueStorageKVClient):
+class RayStorageClient(StorageKVClient):
     """
     Storage client for Ray RDT.
     """
@@ -62,7 +61,7 @@ class RayStorageClient(TransferQueueStorageKVClient):
         except ValueError:
             self.storage_actor = RayObjectRefStorage.options(name="RayObjectRefStorage", get_if_exists=False).remote()
 
-    def put(self, keys: list[str], values: list[Any]) -> Optional[list[Any]]:
+    def put(self, keys: list[str], values: list[Any]) -> list[Any] | None:
         """
         Store tensors to remote storage.
         Args:
