@@ -176,13 +176,31 @@ def get_controller_partition(controller, partition_id: str):
 
 
 def assert_tensor_equal(tensor_a, tensor_b, msg=""):
-    """Assert two tensors are equal."""
-    assert torch.equal(tensor_a, tensor_b), f"{msg} Tensors are not equal: {tensor_a} vs {tensor_b}"
+    """Assert two tensors are equal, handling nested vs dense comparisons."""
+    if (isinstance(tensor_a, torch.Tensor) and tensor_a.is_nested) or (
+        isinstance(tensor_b, torch.Tensor) and tensor_b.is_nested
+    ):
+        seq_a = list(tensor_a)
+        seq_b = list(tensor_b)
+        assert len(seq_a) == len(seq_b), f"{msg} Length mismatch: {len(seq_a)} vs {len(seq_b)}"
+        for t1, t2 in zip(seq_a, seq_b, strict=True):
+            assert torch.equal(t1, t2), f"{msg} Tensors are not equal: {tensor_a} vs {tensor_b}"
+    else:
+        assert torch.equal(tensor_a, tensor_b), f"{msg} Tensors are not equal: {tensor_a} vs {tensor_b}"
 
 
 def assert_tensor_close(tensor_a, tensor_b, rtol=1e-5, atol=1e-8, msg=""):
-    """Assert two tensors are close."""
-    assert torch.allclose(tensor_a, tensor_b, rtol=rtol, atol=atol), f"{msg} Tensors are not close"
+    """Assert two tensors are close, handling nested vs dense comparisons."""
+    if (isinstance(tensor_a, torch.Tensor) and tensor_a.is_nested) or (
+        isinstance(tensor_b, torch.Tensor) and tensor_b.is_nested
+    ):
+        seq_a = list(tensor_a)
+        seq_b = list(tensor_b)
+        assert len(seq_a) == len(seq_b), f"{msg} Length mismatch: {len(seq_a)} vs {len(seq_b)}"
+        for t1, t2 in zip(seq_a, seq_b, strict=True):
+            assert torch.allclose(t1, t2, rtol=rtol, atol=atol), f"{msg} Tensors are not close"
+    else:
+        assert torch.allclose(tensor_a, tensor_b, rtol=rtol, atol=atol), f"{msg} Tensors are not close"
 
 
 def assert_nested_tensor_equal(nested_a, nested_b, msg=""):

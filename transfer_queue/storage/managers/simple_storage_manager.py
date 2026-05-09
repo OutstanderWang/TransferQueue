@@ -326,17 +326,19 @@ class AsyncSimpleStorageManager(StorageManager):
         """
         Pack a list of per-sample values into a batched container.
 
-        For pure tensor lists (no None), this performs a memory copy via stacking
-        or nested tensor creation. Mixed types, non-tensor values, or lists
-        containing None placeholders are grouped into a ``NonTensorStack``.
+        For pure tensor lists (no None), this tries nested tensor
+        (jagged layout first, then strided fallback), then falls back to
+        ``NonTensorStack``. Scalar tensors are stacked densely.
+        Mixed types, non-tensor values, or lists containing None placeholders
+        are grouped into a ``NonTensorStack``.
 
         Args:
             values: List of per-sample values to pack. May contain None for
                 unfilled batch positions.
 
         Returns:
-            A stacked ``torch.Tensor`` (or nested tensor) when all values are
-            tensors, otherwise a ``NonTensorStack``.
+            A ``torch.Tensor`` (nested or dense) when all values are tensors,
+            otherwise a ``NonTensorStack``.
 
         Raises:
             ValueError: If *values* is empty.
@@ -346,9 +348,11 @@ class AsyncSimpleStorageManager(StorageManager):
         non_none = [v for v in values if v is not None]
         if non_none and all(isinstance(v, torch.Tensor) for v in non_none):
             if len(non_none) == len(values):
-                # Pure tensor list — try stacking / nested tensor
-                if all(v.shape == values[0].shape for v in values):
-                    return torch.stack(values)
+                # Scalar tensors cannot be represented as jagged nested tensors;
+                # stack them densely to avoid noisy fallback warnings.
+                if all(v.dim() == 0 for v in non_none):
+                    return torch.stack(non_none)
+                # Pure tensor list — try nested tensor
                 try:
                     return torch.nested.as_nested_tensor(values, layout=torch.jagged)
                 except (RuntimeError, TypeError) as e:
@@ -356,8 +360,15 @@ class AsyncSimpleStorageManager(StorageManager):
                         f"Failed to pack nested tensor with jagged layout. "
                         f"Falling back to strided layout. Detailed error: {e}"
                     )
-                    return torch.nested.as_nested_tensor(values, layout=torch.strided)
-            # Mixed tensor + None — cannot stack, fall through to NonTensorStack
+                    try:
+                        return torch.nested.as_nested_tensor(values, layout=torch.strided)
+                    except (RuntimeError, TypeError) as e2:
+                        logger.warning(
+                            f"Failed to pack nested tensor with strided layout. "
+                            f"Falling back to NonTensorStack. Detailed error: {e2}"
+                        )
+                        return NonTensorStack(*values)
+            # Mixed tensor + None — cannot create nested tensor, fall through to NonTensorStack
         return NonTensorStack(*values)
 
     async def get_data(self, metadata: BatchMeta) -> TensorDict:
