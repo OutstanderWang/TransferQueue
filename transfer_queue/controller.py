@@ -21,7 +21,7 @@ from dataclasses import dataclass, field
 from itertools import groupby
 from operator import itemgetter
 from threading import Lock, Thread
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
 import numpy as np
@@ -47,6 +47,9 @@ from transfer_queue.utils.zmq_utils import (
     get_free_port,
     get_node_ip_address,
 )
+
+if TYPE_CHECKING:
+    from transfer_queue.metrics import TQMetricsExporter
 
 logger = get_logger(__name__)
 
@@ -1012,6 +1015,10 @@ class TransferQueueController:
         # Connected storage managers tracking
         self._connected_storage_managers: set[str] = set()
 
+        # Prometheus metrics exporter (lazy-initialized when enabled)
+        self._metrics: TQMetricsExporter | None = None
+        self._metrics_endpoint: str = ""
+
         # Start background processing threads
         self._start_process_handshake()
         self._start_process_update_data_status()
@@ -1800,13 +1807,15 @@ class TransferQueueController:
         perf_monitor = IntervalPerfMonitor(caller_name=self.controller_id)
 
         while True:
+            monitor = self._metrics if self._metrics is not None else perf_monitor
+
             messages = self.request_handle_socket.recv_multipart(copy=False)
             identity = messages.pop(0)
             serialized_msg = messages
             request_msg = ZMQMessage.deserialize(serialized_msg)
 
             if request_msg.request_type == ZMQRequestType.GET_META:
-                with perf_monitor.measure(op_type="GET_META"):
+                with monitor.measure(op_type="GET_META"):
                     params = request_msg.body
 
                     metadata = self.get_metadata(
@@ -1826,7 +1835,7 @@ class TransferQueueController:
                     )
 
             elif request_msg.request_type == ZMQRequestType.GET_PARTITION_META:
-                with perf_monitor.measure(op_type="GET_PARTITION_META"):
+                with monitor.measure(op_type="GET_PARTITION_META"):
                     params = request_msg.body
                     partition_id = params["partition_id"]
                     partition = self._get_partition(partition_id)
@@ -1848,7 +1857,7 @@ class TransferQueueController:
                         body={"metadata": metadata},
                     )
             elif request_msg.request_type == ZMQRequestType.SET_CUSTOM_META:
-                with perf_monitor.measure(op_type="SET_CUSTOM_META"):
+                with monitor.measure(op_type="SET_CUSTOM_META"):
                     params = request_msg.body
                     partition_custom_meta = params["partition_custom_meta"]
 
@@ -1862,12 +1871,14 @@ class TransferQueueController:
                     )
 
             elif request_msg.request_type == ZMQRequestType.CLEAR_META:
-                with perf_monitor.measure(op_type="CLEAR_META"):
+                with monitor.measure(op_type="CLEAR_META"):
                     params = request_msg.body
                     global_indexes = params["global_indexes"]
                     partition_ids = params["partition_ids"]
 
                     self.clear_meta(global_indexes, partition_ids)
+                    if self._metrics is not None:
+                        self._metrics.record_samples("CLEAR_META", len(global_indexes))
 
                     response_msg = ZMQMessage.create(
                         request_type=ZMQRequestType.CLEAR_META_RESPONSE,
@@ -1877,7 +1888,7 @@ class TransferQueueController:
                     )
 
             elif request_msg.request_type == ZMQRequestType.CLEAR_PARTITION:
-                with perf_monitor.measure(op_type="CLEAR_PARTITION"):
+                with monitor.measure(op_type="CLEAR_PARTITION"):
                     params = request_msg.body
                     partition_id = params["partition_id"]
 
@@ -1890,7 +1901,7 @@ class TransferQueueController:
                     )
 
             elif request_msg.request_type == ZMQRequestType.GET_CONSUMPTION:
-                with perf_monitor.measure(op_type="GET_CONSUMPTION"):
+                with monitor.measure(op_type="GET_CONSUMPTION"):
                     # Handle consumption status checks
                     params = request_msg.body
 
@@ -1915,7 +1926,7 @@ class TransferQueueController:
                     )
 
             elif request_msg.request_type == ZMQRequestType.RESET_CONSUMPTION:
-                with perf_monitor.measure(op_type="RESET_CONSUMPTION"):
+                with monitor.measure(op_type="RESET_CONSUMPTION"):
                     # Handle reset consumption status request
                     params = request_msg.body
                     partition_id = params["partition_id"]
@@ -1945,7 +1956,7 @@ class TransferQueueController:
                         )
 
             elif request_msg.request_type == ZMQRequestType.GET_PRODUCTION:
-                with perf_monitor.measure(op_type="GET_PRODUCTION"):
+                with monitor.measure(op_type="GET_PRODUCTION"):
                     # Handle production status checks
                     params = request_msg.body
 
@@ -1965,7 +1976,7 @@ class TransferQueueController:
                     )
 
             elif request_msg.request_type == ZMQRequestType.GET_LIST_PARTITIONS:
-                with perf_monitor.measure(op_type="GET_LIST_PARTITIONS"):
+                with monitor.measure(op_type="GET_LIST_PARTITIONS"):
                     # Handle list partitions request
                     partition_ids = self.list_partitions()
                     response_msg = ZMQMessage.create(
@@ -1976,7 +1987,7 @@ class TransferQueueController:
                     )
 
             elif request_msg.request_type == ZMQRequestType.KV_RETRIEVE_META:
-                with perf_monitor.measure(op_type="KV_RETRIEVE_META"):
+                with monitor.measure(op_type="KV_RETRIEVE_META"):
                     params = request_msg.body
                     keys = params["keys"]
                     partition_id = params["partition_id"]
@@ -1991,7 +2002,7 @@ class TransferQueueController:
                     )
 
             elif request_msg.request_type == ZMQRequestType.KV_RETRIEVE_KEYS:
-                with perf_monitor.measure(op_type="KV_RETRIEVE_KEYS"):
+                with monitor.measure(op_type="KV_RETRIEVE_KEYS"):
                     params = request_msg.body
                     global_indexes = params["global_indexes"]
                     partition_id = params["partition_id"]
@@ -2005,7 +2016,7 @@ class TransferQueueController:
                     )
 
             elif request_msg.request_type == ZMQRequestType.KV_LIST:
-                with perf_monitor.measure(op_type="KV_LIST"):
+                with monitor.measure(op_type="KV_LIST"):
                     params = request_msg.body
                     partition_id = params["partition_id"]
                     if partition_id is None:
@@ -2043,25 +2054,29 @@ class TransferQueueController:
         perf_monitor = IntervalPerfMonitor(caller_name=self.controller_id)
 
         while True:
+            monitor = self._metrics if self._metrics is not None else perf_monitor
+
             messages = self.data_status_update_socket.recv_multipart(copy=False)
             identity = messages.pop(0)
             serialized_msg = messages
             request_msg = ZMQMessage.deserialize(serialized_msg)
 
             if request_msg.request_type == ZMQRequestType.NOTIFY_DATA_UPDATE:
-                with perf_monitor.measure(op_type="NOTIFY_DATA_UPDATE"):
+                with monitor.measure(op_type="NOTIFY_DATA_UPDATE"):
                     message_data = request_msg.body
                     partition_id = message_data.get("partition_id")
+                    global_indexes = message_data.get("global_indexes", [])
 
                     # Update production status
                     success = self.update_production_status(
                         partition_id=partition_id,
-                        global_indexes=message_data.get("global_indexes", []),
+                        global_indexes=global_indexes,
                         field_schema=message_data.get("field_schema", {}),
                         custom_backend_meta=message_data.get("custom_backend_meta", {}),
                     )
-
                     if success:
+                        if self._metrics is not None:
+                            self._metrics.record_samples("NOTIFY_DATA_UPDATE", len(global_indexes))
                         logger.debug(f"[{self.controller_id}]: Updated production status for partition {partition_id}")
 
                     # Send acknowledgment
@@ -2111,3 +2126,101 @@ class TransferQueueController:
             raise TypeError(
                 f"sampler {getattr(sampler, '__name__', repr(sampler))} must be an instance or subclass of BaseSampler"
             )
+
+    # ==================== Metrics API ====================
+
+    def _build_metrics_snapshot(self) -> dict:
+        """Build a plain-dict snapshot of controller state for the metrics exporter.
+
+        The snapshot contains only primitive / dict values — no references to
+        live controller objects — so the metrics thread can read it safely.
+        """
+        partitions_data: dict = {}
+        for pid, partition in list(self.partitions.items()):
+            try:
+                stats = partition.get_statistics()
+                # Build per-task production statistics from registered tasks.
+                # Always emit an "all" entry so production progress is visible
+                # even before any consumer tasks are registered.
+                production_statistics: dict = {}
+                if "production_progress" in stats:
+                    production_statistics["all"] = {
+                        "production_progress": stats["production_progress"],
+                    }
+                for task_name in stats.get("registered_tasks", []):
+                    production_statistics[task_name] = {
+                        "production_progress": stats.get("production_progress", 0),
+                    }
+                partitions_data[pid] = {
+                    "total_samples_num": stats["total_samples_num"],
+                    "production_statistics": production_statistics,
+                    "consumption_statistics": {
+                        task_name: {"consumption_progress": cstats.get("consumption_progress", 0)}
+                        for task_name, cstats in stats.get("consumption_statistics", {}).items()
+                    },
+                }
+            except Exception:
+                pass
+
+        return {
+            "partitions": partitions_data,
+            "global_index_allocated": len(self.index_manager.allocated_indexes),
+            "global_index_reusable": len(self.index_manager.reusable_indexes),
+        }
+
+    def _push_metrics_snapshot(self) -> None:
+        """Push a fresh metrics snapshot to the exporter (called from controller threads)."""
+        if self._metrics is None:
+            return
+        try:
+            snapshot = self._build_metrics_snapshot()
+            self._metrics.update_controller_snapshot(snapshot)
+        except Exception as e:
+            logger.debug(f"[{self.controller_id}]: Failed to push metrics snapshot: {e}")
+
+    def start_metrics(self, port: int = 0) -> str:
+        """Initialize and start the Prometheus metrics exporter.
+
+        This creates a ``TQMetricsExporter``, starts an HTTP ``/metrics``
+        endpoint and a background collection thread.  The method is safe
+        to call multiple times -- subsequent calls return the existing endpoint.
+
+        Args:
+            port: HTTP port for the /metrics endpoint (0 = auto-assign).
+
+        Returns:
+            The metrics endpoint address in ``host:port`` format.
+        """
+        if self._metrics is not None:
+            return self._metrics_endpoint
+        from transfer_queue.metrics import TQMetricsExporter
+
+        self._metrics = TQMetricsExporter()
+        self._metrics_endpoint = self._metrics.start(node_ip=self._node_ip, port=port)
+        # Launch a daemon thread that periodically pushes controller state
+        # snapshots to the exporter, keeping them process-isolated.
+        self._metrics_snapshot_thread = Thread(
+            target=self._metrics_snapshot_loop,
+            name="TQMetricsSnapshotThread",
+            daemon=True,
+        )
+        self._metrics_snapshot_thread.start()
+        logger.info(f"[{self.controller_id}]: Prometheus metrics exporter started on {self._metrics_endpoint}")
+        return self._metrics_endpoint
+
+    def _metrics_snapshot_loop(self) -> None:
+        """Periodically push a metrics snapshot to the exporter."""
+        from transfer_queue.metrics import TQ_METRICS_COLLECT_INTERVAL
+
+        while True:
+            self._push_metrics_snapshot()
+            time.sleep(TQ_METRICS_COLLECT_INTERVAL)
+
+    def register_storage_units_for_metrics(self, storage_unit_infos: dict) -> None:
+        """Register storage unit ZMQ endpoints so the metrics collector can query them.
+
+        Args:
+            storage_unit_infos: Mapping of storage unit names/IDs to ``ZMQServerInfo``.
+        """
+        if self._metrics is not None:
+            self._metrics.register_storage_units(storage_unit_infos)

@@ -17,9 +17,10 @@ import os
 import time
 import weakref
 from threading import Event, Thread
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from uuid import uuid4
 
+import psutil
 import ray
 import zmq
 
@@ -36,6 +37,9 @@ from transfer_queue.utils.zmq_utils import (
     get_free_port,
     get_node_ip_address,
 )
+
+if TYPE_CHECKING:
+    from transfer_queue.metrics import TQMetricsExporter
 
 logger = get_logger(__name__)
 
@@ -63,6 +67,11 @@ class StorageUnitData:
         self.storage_size = storage_size
         # Track active global_index keys for O(1) capacity checks
         self._active_keys: set = set()
+
+    @property
+    def active_key_count(self) -> int:
+        """Number of active keys currently stored."""
+        return len(self._active_keys)
 
     def get_data(self, fields: list[str], global_indexes: list) -> dict[str, list]:
         """Get data by global index keys.
@@ -108,8 +117,9 @@ class StorageUnitData:
                 )
             if f not in self.field_data:
                 self.field_data[f] = {}
+            field_dict = self.field_data[f]
             for key, val in zip(global_indexes, values, strict=True):
-                self.field_data[f][key] = val
+                field_dict[key] = val
         self._active_keys.update(global_indexes)
 
     def clear(self, keys: list[int]) -> None:
@@ -164,6 +174,8 @@ class SimpleStorageUnit:
         self.put_get_socket: zmq.Socket | None = None
         self.proxy_thread: Thread | None = None
         self.worker_thread: Thread | None = None
+
+        self._metrics: TQMetricsExporter | None = None
 
         self._init_zmq_socket()
         self._start_process_put_get()
@@ -258,6 +270,7 @@ class SimpleStorageUnit:
         perf_monitor = IntervalPerfMonitor(caller_name=f"{self.storage_unit_id}")
 
         while not self._shutdown_event.is_set():
+            monitor = self._metrics if self._metrics is not None else perf_monitor
             try:
                 socks = dict(poller.poll(TQ_STORAGE_POLLER_TIMEOUT * 1000))
             except zmq.error.ContextTerminated:
@@ -285,14 +298,16 @@ class SimpleStorageUnit:
 
                     # Process request
                     if operation == ZMQRequestType.PUT_DATA:  # type: ignore[arg-type]
-                        with perf_monitor.measure(op_type="PUT_DATA"):
+                        with monitor.measure(op_type="PUT_DATA"):
                             response_msg = self._handle_put(request_msg)
                     elif operation == ZMQRequestType.GET_DATA:  # type: ignore[arg-type]
-                        with perf_monitor.measure(op_type="GET_DATA"):
+                        with monitor.measure(op_type="GET_DATA"):
                             response_msg = self._handle_get(request_msg)
                     elif operation == ZMQRequestType.CLEAR_DATA:  # type: ignore[arg-type]
-                        with perf_monitor.measure(op_type="CLEAR_DATA"):
+                        with monitor.measure(op_type="CLEAR_DATA"):
                             response_msg = self._handle_clear(request_msg)
+                    elif operation == ZMQRequestType.GET_METRICS:  # type: ignore[arg-type]
+                        response_msg = self._handle_get_metrics()
                     else:
                         response_msg = ZMQMessage.create(
                             request_type=ZMQRequestType.PUT_GET_OPERATION_ERROR,  # type: ignore[arg-type]
@@ -478,6 +493,85 @@ class SimpleStorageUnit:
             )
         return response_msg
 
+    def _handle_get_metrics(self) -> ZMQMessage:
+        """Handle GET_METRICS request by returning storage unit statistics.
+
+        Returns:
+            ZMQMessage containing storage unit ID, capacity, active keys,
+            process RSS memory, and per-operation request stats.
+        """
+        try:
+            process_rss = psutil.Process().memory_info().rss
+        except Exception:
+            process_rss = 0
+
+        metrics = {
+            "storage_unit_id": self.storage_unit_id,
+            "capacity": self.storage_unit_size,
+            "active_keys": self.storage_data.active_key_count,
+            "process_rss_bytes": process_rss,
+        }
+
+        # Include per-operation stats if Prometheus metrics are enabled
+        if self._metrics is not None:
+            op_stats = {}
+            for op_type in ("PUT_DATA", "GET_DATA", "CLEAR_DATA"):
+                try:
+                    hist = self._metrics.request_duration.labels(op_type=op_type)
+                    counter = self._metrics.request_total.labels(op_type=op_type)
+                    duration_sum = hist._sum.get()
+                    # Build cumulative counts once, reuse for total and quantiles
+                    cumulative_counts = self._cumulative_bucket_counts(hist)
+                    duration_count = cumulative_counts[-1] if cumulative_counts else 0
+                    op_stats[op_type] = {
+                        "request_count": counter._value.get(),
+                        "latency_avg": duration_sum / duration_count if duration_count > 0 else 0,
+                        "latency_p50": self._quantile_from_cumulative(hist, cumulative_counts, 0.50),
+                        "latency_p99": self._quantile_from_cumulative(hist, cumulative_counts, 0.99),
+                    }
+                except (AttributeError, TypeError, ZeroDivisionError) as e:
+                    logger.debug(f"[{self.storage_unit_id}]: Failed to extract metrics for {op_type}: {e}")
+            if op_stats:
+                metrics["op_stats"] = op_stats
+
+        return ZMQMessage.create(
+            request_type=ZMQRequestType.METRICS_RESPONSE,
+            sender_id=self.storage_unit_id,
+            body=metrics,
+        )
+
+    @staticmethod
+    def _cumulative_bucket_counts(hist) -> list[float]:
+        """Build cumulative counts from a prometheus_client Histogram's non-cumulative buckets."""
+        cumulative = 0.0
+        counts = []
+        for bucket in hist._buckets:
+            cumulative += bucket.get()
+            counts.append(cumulative)
+        return counts
+
+    @staticmethod
+    def _quantile_from_cumulative(hist, cumulative_counts: list[float], q: float) -> float:
+        """Estimate a quantile using pre-computed cumulative bucket counts.
+
+        Uses linear interpolation matching Prometheus histogram_quantile() logic.
+        """
+        total = cumulative_counts[-1] if cumulative_counts else 0
+        if total == 0:
+            return 0.0
+        target = q * total
+        prev_bound = 0.0
+        prev_cumulative = 0.0
+        for bound, cum_count in zip(hist._upper_bounds, cumulative_counts, strict=False):
+            if cum_count >= target:
+                fraction = (
+                    (target - prev_cumulative) / (cum_count - prev_cumulative) if cum_count > prev_cumulative else 0
+                )
+                return prev_bound + (bound - prev_bound) * fraction
+            prev_bound = bound
+            prev_cumulative = cum_count
+        return prev_bound
+
     @staticmethod
     def _shutdown_resources(
         shutdown_event: Event,
@@ -507,6 +601,27 @@ class SimpleStorageUnit:
             proxy_thread.join(timeout=5)
 
         logger.info("SimpleStorageUnit resources shutdown complete.")
+
+    def start_metrics(self, port: int = 0) -> str:
+        """Initialize and start the Prometheus metrics exporter for this storage unit.
+
+        When enabled, replaces ``IntervalPerfMonitor`` for request latency/throughput
+        tracking with Prometheus counters and histograms.
+
+        Args:
+            port: HTTP port for the /metrics endpoint (0 = auto-assign).
+
+        Returns:
+            The metrics endpoint address in ``host:port`` format.
+        """
+        if self._metrics is not None:
+            return self._metrics.endpoint
+        from transfer_queue.metrics import TQMetricsExporter
+
+        self._metrics = TQMetricsExporter(role="storage")
+        endpoint = self._metrics.start(node_ip=self._node_ip, port=port)
+        logger.info(f"[{self.storage_unit_id}]: Prometheus metrics exporter started on {endpoint}")
+        return endpoint
 
     def get_zmq_server_info(self) -> ZMQServerInfo:
         """Get the ZMQ server information for this storage unit.
