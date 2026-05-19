@@ -13,13 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import math
 import os
 import subprocess
 import time
 from importlib import resources
 from typing import Any, Callable
-from urllib.parse import urlparse
 
 import ray
 import torch
@@ -32,13 +30,9 @@ from transfer_queue.controller import TransferQueueController
 from transfer_queue.metadata import KVBatchMeta
 from transfer_queue.sampler import *  # noqa: F401
 from transfer_queue.sampler import BaseSampler
-from transfer_queue.storage.simple_storage import SimpleStorageUnit
-from transfer_queue.utils.common import get_placement_group
+from transfer_queue.storage.bootstrap import StorageBootstrapProvider
 from transfer_queue.utils.logging_utils import get_logger
-from transfer_queue.utils.yuanrong_utils import (
-    cleanup_yuanrong_resources,
-    initialize_yuanrong_backend,
-)
+from transfer_queue.utils.yuanrong_utils import cleanup_yuanrong_resources
 from transfer_queue.utils.zmq_utils import process_zmq_server_info
 
 logger = get_logger(__name__)
@@ -70,125 +64,23 @@ def _maybe_create_tq_client(conf: DictConfig | None = None) -> TransferQueueClie
     return _TQ_CLIENT
 
 
-# TODO(hz): Adopt registry pattern to manage storage backends for better scalability.
 def _maybe_create_tq_storage(conf: DictConfig) -> DictConfig:
     global _TQ_STORAGE
 
     if _TQ_STORAGE is None:
         _TQ_STORAGE = {}
-        if conf.backend.storage_backend == "SimpleStorage":
-            # initialize SimpleStorageUnit
-            simple_storage_handles = {}
-            num_data_storage_units = conf.backend.SimpleStorage.num_data_storage_units
-            total_storage_size = conf.backend.SimpleStorage.total_storage_size
-            storage_placement_group = get_placement_group(num_data_storage_units, num_cpus_per_actor=1)
-
-            for storage_unit_rank in range(num_data_storage_units):
-                storage_node = SimpleStorageUnit.options(  # type: ignore[attr-defined]
-                    placement_group=storage_placement_group,
-                    placement_group_bundle_index=storage_unit_rank,
-                    name=f"TransferQueueStorageUnit#{storage_unit_rank}",
-                ).remote(
-                    storage_unit_size=math.ceil(total_storage_size / num_data_storage_units),
-                )
-                simple_storage_handles[f"TransferQueueStorageUnit#{storage_unit_rank}"] = storage_node
-                logger.info(f"TransferQueueStorageUnit#{storage_unit_rank} has been created.")
-
-            storage_zmq_info = process_zmq_server_info(simple_storage_handles)
-            backend_name = conf.backend.storage_backend
-            conf.backend[backend_name].zmq_info = storage_zmq_info
-            _TQ_STORAGE["SimpleStorage"] = simple_storage_handles
-        if conf.backend.storage_backend == "MooncakeStore":
-            if conf.backend.MooncakeStore.auto_init:
-                # Try to kill existing mooncake_master processes before starting a new one to avoid potential conflicts
-                check = subprocess.run(["pgrep", "-f", "mooncake_master"], stdout=subprocess.PIPE, text=True)
-                if check.returncode == 0:
-                    pids = check.stdout.strip().replace("\n", ", ")
-                    logger.info(f"Find existing mooncake_master (PID: {pids}), try to kill first...")
-
-                    result = os.system('pkill -f "[m]ooncake_master"')
-                    if result == 0:
-                        logger.info("Successfully killed existing mooncake_master processes.")
-                    else:
-                        raise RuntimeError(f"Failed to kill existing mooncake_master processes (exit code: {result}).")
-
-                # process metadata_server
-                metadata_server_raw_address = conf.backend.MooncakeStore.metadata_server
-                if "://" not in metadata_server_raw_address:
-                    metadata_server_raw_address = "//" + metadata_server_raw_address
-
-                metadata_server_parsed = urlparse(metadata_server_raw_address)
-
-                if not metadata_server_parsed.hostname or metadata_server_parsed.port is None:
-                    raise ValueError(
-                        f"Invalid metadata_server '{conf.backend.MooncakeStore.metadata_server}'. "
-                        f"Host and port are required (e.g., host:port)."
-                    )
-
-                metadata_server_host = metadata_server_parsed.hostname
-                metadata_server_port = str(metadata_server_parsed.port)
-
-                # process master_server
-                master_server_raw_address = conf.backend.MooncakeStore.master_server_address
-                if "://" not in master_server_raw_address:
-                    master_server_raw_address = "//" + master_server_raw_address
-
-                master_server_parsed = urlparse(master_server_raw_address)
-
-                if not master_server_parsed.hostname or master_server_parsed.port is None:
-                    raise ValueError(
-                        f"Invalid master_server_address '{conf.backend.MooncakeStore.master_server_address}'. "
-                        f"Host and port are required (e.g., host:port)."
-                    )
-
-                master_server_port = str(master_server_parsed.port)
-
-                cmd = [
-                    "mooncake_master",
-                    "-client_ttl=30",
-                    "-default_kv_lease_ttl=999999",
-                    "-default_kv_soft_pin_ttl=999999",
-                    "--eviction_high_watermark_ratio=1.0",
-                    "--eviction_ratio=0.0",
-                    "--enable_http_metadata_server=true",
-                    "--allow_evict_soft_pinned_objects=false",
-                    f"--http_metadata_server_host={metadata_server_host}",
-                    f"--http_metadata_server_port={metadata_server_port}",
-                    f"--rpc_port={master_server_port}",
-                ]
-
-                log_file_path = "/tmp/mooncake_master.log"
-                with open(log_file_path, "w") as log_file:
-                    process = subprocess.Popen(
-                        cmd,
-                        stdout=log_file,
-                        stderr=subprocess.STDOUT,
-                        text=True,
-                        bufsize=1,
-                        universal_newlines=True,
-                        start_new_session=True,
-                    )
-                    time.sleep(3)
-
-                if process.poll() is None:
-                    logger.info(
-                        f"mooncake_master started, PID: {process.pid}. Logs are at: {os.path.abspath(log_file_path)}"
-                    )
-                else:
-                    error_msg = ""
-                    try:
-                        with open(log_file_path) as f:
-                            error_msg = f.read()
-                    except Exception as e:
-                        error_msg = f"Failed to read log file: {e}"
-
-                    raise RuntimeError(
-                        f"mooncake_master exited with error. Check {log_file_path} for detailed logs. "
-                        f"Output:\n{error_msg}"
-                    )
-                _TQ_STORAGE["MooncakeStore"] = process
-        if conf.backend.storage_backend == "Yuanrong" and conf.backend.Yuanrong.auto_init:
-            _TQ_STORAGE["Yuanrong"] = initialize_yuanrong_backend(conf)
+        backend_name = conf.backend.storage_backend
+        provider_fn = StorageBootstrapProvider.get_provider(backend_name)
+        if provider_fn is not None:
+            backend_resources = provider_fn(conf)
+            if backend_resources is not None:
+                _TQ_STORAGE[backend_name] = backend_resources
+            else:
+                logger.error(f"Not found available {backend_name} storage resources, please check the config.")
+        else:
+            logger.error(
+                f"Storage backend {backend_name} not registered. Please add it to the StorageBootstrapProvider."
+            )
     return conf
 
 
