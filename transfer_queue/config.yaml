@@ -61,9 +61,23 @@ backend:
     metastore_port: 2379
     # If enable npu transport
     enable_yr_npu_transport: false
+    # If enable host RDMA (H2H) transport via UCX. Requires RDMA NIC hardware and rdma-core driver.
+    # See https://pages.openeuler.openatom.cn/openyuanrong-datasystem/docs/zh-cn/latest/best_practices/best_practices_for_rdma.html
+    enable_rdma: false
+    # UCX env vars passed to dscli subprocess. Precedence: ucx_env_vars > parent env > TQ default (UCX_TLS=rc_x when enable_rdma=true).
+    #   UCX_TLS:          RDMA transport mode. "rc_x" (default when RDMA enabled and unset), "rc" (compatible), "ud" (low-latency), "dc" (large-scale).
+    #   UCX_LOG_FILE:     Path to UCX log file. Requires UCX_LOG_LEVEL to be set.
+    #   UCX_LOG_LEVEL:    FATAL, ERROR, WARN, INFO, DEBUG, TRACE. Use DEBUG/TRACE for troubleshooting.
+    #   UCX_NET_DEVICES:  RDMA device name (e.g., mlx5_0:1). Required in multi-NIC setups.
+    #   UCX_TCP_CM_ROUTE: TCP control-flow interface for UCX connection setup.
+    # Example: ucx_env_vars: { UCX_TLS: rc_x, UCX_LOG_FILE: /tmp/ucx.log, UCX_LOG_LEVEL: ERROR }
+    ucx_env_vars: {}
     # Additional config for yuanrong worker.
     # Recommended options for NPU environments:
     #   --remote_h2d_device_ids       Enable RH2D for efficient cross-node data transfer. Specify NPU device IDs (comma-separated).
     #   --enable_huge_tlb             Enable huge page memory to improve performance. Required for >21GB shared memory on 910B.
+    #                                 Before enabling, OS config required (root privilege):
+    #                                   sysctl -w vm.nr_hugepages=<count>  (each page is 2MB, e.g. 65536 for 128GB)
+    #                                   ulimit -l unlimited               (allow pinning enough memory for RDMA/Ascend)
     # Example: "--shared_memory_size_mb 16384 --remote_h2d_device_ids 0,1,2,3 --enable_huge_tlb true"
     worker_args: "--shared_memory_size_mb 8192"
