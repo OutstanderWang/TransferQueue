@@ -120,6 +120,10 @@ def start_datasystem_worker(
     if device_ids or enable_rdma or ucx_env_vars:
         env = os.environ.copy()
         if device_ids:
+            # Ensure direct copy for specified devices
+            env.setdefault("DS_D2H_MEMCPY_POLICY", "direct")
+            env.setdefault("DS_H2D_MEMCPY_POLICY", "direct")
+
             env["ASCEND_RT_VISIBLE_DEVICES"] = device_ids
             logger.info(
                 f"Setting ASCEND_RT_VISIBLE_DEVICES={device_ids} for dscli subprocess ({node_type} at {worker_address})"

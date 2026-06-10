@@ -219,3 +219,37 @@ class TestYuanrongStorageE2E:
                 assert_tensors_equal(o, r)
             else:
                 assert o == r
+
+    def test_get_with_invalid_backend_meta_raises_error(self, config):
+        """Verify that get raises ValueError when backend_meta contains an unrecognized tag."""
+        client = self.client_cls(config)
+        keys = ["k1"]
+        shapes = [[]]
+        dtypes = [None]
+        invalid_meta = ["99"]
+        with pytest.raises(ValueError, match="Cannot retrieve stored data"):
+            client.get(keys, shapes, dtypes, invalid_meta)
+
+    def test_get_with_empty_backend_meta_raises_error(self, config):
+        """Verify that get raises ValueError when backend_meta contains empty tags (not previously stored)."""
+        client = self.client_cls(config)
+        keys = ["k1"]
+        shapes = [[]]
+        dtypes = [None]
+        empty_meta = [""]
+        with pytest.raises(ValueError, match="no backend metadata"):
+            client.get(keys, shapes, dtypes, empty_meta)
+
+    def test_put_with_no_strategies_raises_error(self, config):
+        """Verify that put raises ValueError when no strategy supports the value type."""
+        client = self.client_cls(config)
+        client._strategies = []
+        with pytest.raises(ValueError, match=f"No storage backend can handle {self.client_cls.ROUTE_ITEM_AS_VALUE}"):
+            client.put(["k1"], [1])
+
+    def test_clear_with_empty_backend_meta_silent(self, config):
+        """Verify that clear silently skips keys with empty backend_meta (not previously stored)."""
+        client = self.client_cls(config)
+        empty_meta = [""]
+        # No exception, no warning — only debug log
+        client.clear(["k1"], empty_meta)

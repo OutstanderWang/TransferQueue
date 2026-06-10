@@ -420,7 +420,7 @@ ps aux | grep datasystem_worker
 dscli stop --worker_address <IP>:<PORT>
 
 # Force cleanup (use with caution)
-pkill -f datasystem_worker
+pkill -9 -f datasystem_worker
 ```
 
 ### Multi-Process Initialization
@@ -462,6 +462,21 @@ RuntimeError: code: [Out of memory], msg: [Shared memory no space in arena: ...]
 ```
 
 Solution: Increase `--shared_memory_size_mb` in `worker_args`, or reduce the data volume being cached.
+
+### "Cannot retrieve stored data" Error on get/clear
+
+If you encounter an error like:
+```
+ValueError: Cannot retrieve stored data because the backend that originally stored it is unavailable in the current process or node. Please check that the configuration and NPU resource availability are consistent across all processes and nodes.
+```
+
+This occurs when `kv_batch_get` cannot find the storage backend that originally handled the data. The most common cause is a mismatch between the process that originally `put` the data and the process performing `get`, such as:
+
+- Different `enable_yr_npu_transport` settings across processes or nodes (e.g., `true` vs `false`).
+- NPU hardware or CANN/torch-npu unavailable on the `get` process or node, even though the configuration is identical.
+- When running inside Ray actors, the actor may not be assigned NPU resources (e.g., missing `"NPU": 1` in `.options(resources=...)`), preventing the NPU transport backend from initializing.
+
+Solution: Ensure that all processes and nodes use the same TransferQueue configuration and have consistent NPU resource availability. When using Ray actors, make sure NPU resources are properly allocated via `.options(resources={"NPU": 1})`.
 
 
 ## Datasystem Logs
