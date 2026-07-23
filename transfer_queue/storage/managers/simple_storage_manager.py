@@ -49,6 +49,10 @@ with_storage_unit_socket = with_zmq_socket(
     "put_get_socket",
     get_identity=lambda self: self.storage_manager_id,
     get_peer=lambda self, target: self.storage_unit_infos[target],
+    # Long-lived context from the base StorageManager (base.py). Now shared by both the
+    # notify path (_notify_and_wait) and the per-call storage-unit request sockets below;
+    # this is safe because the context is loop-agnostic and each socket stays per-call.
+    get_context=lambda self: self.zmq_context,
     resolve_target=lambda args, kwargs: kwargs.get("target_storage_unit"),
     timeout=TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT,
 )

@@ -43,6 +43,7 @@ with_controller_socket = with_zmq_socket(
     "request_handle_socket",
     get_identity=lambda self: self.client_id,
     get_peer=lambda self, target: self._controller,
+    get_context=lambda self: self.zmq_context,
 )
 
 
@@ -70,6 +71,10 @@ class AsyncTransferQueueClient:
             raise TypeError(f"controller_info must be ZMQServerInfo, got {type(controller_info)}")
         self.client_id = client_id
         self._controller: ZMQServerInfo = controller_info
+        # Long-lived ZMQ context shared by all controller RPCs on this client. Contexts are
+        # thread-safe and event-loop-agnostic; each RPC creates and closes its own DEALER
+        # socket from this context (see with_controller_socket). Terminated once in close().
+        self.zmq_context = zmq.asyncio.Context()
         logger.info(f"[{self.client_id}]: Registered Controller server {controller_info.id} at {controller_info.ip}")
 
     def initialize_storage_manager(
@@ -1094,6 +1099,14 @@ class AsyncTransferQueueClient:
                     self.storage_manager.close()
         except Exception as e:
             logger.warning(f"Error closing storage manager: {e}")
+
+        # Tear down the shared context last. destroy(linger=0) force-closes any socket that
+        # leaked from an interrupted RPC then terminates, so shutdown cannot hang.
+        try:
+            if hasattr(self, "zmq_context") and self.zmq_context is not None:
+                self.zmq_context.destroy(linger=0)
+        except Exception as e:
+            logger.warning(f"[{self.client_id}]: Error terminating zmq_context: {e}")
 
     # ==================== Checkpoint API ====================
     @with_controller_socket
