@@ -391,7 +391,9 @@ class StorageManager(ABC):
             else:
                 logger.debug(f"[{self.storage_manager_id}]: Notify ZMQ thread shut down.")
 
-        self.zmq_context.term()
+        # destroy(linger=0) force-closes any socket still open (e.g. from an interrupted
+        # request or the notify path) then terminates, so shutdown cannot hang on term().
+        self.zmq_context.destroy(linger=0)
 
     def __del__(self):
         """Destructor to ensure resources are cleaned up."""
