@@ -97,14 +97,11 @@ class AsyncTransferQueueClient:
                     - zmq_info: ZMQ server information about the storage units
 
         """
-        create_kwargs = {}
-        if manager_type == "SimpleStorage":
-            create_kwargs["zmq_context"] = self.zmq_context
         self.storage_manager = StorageManagerFactory.create(
             manager_type,
             controller_info=self._controller,
             config=config,
-            **create_kwargs,
+            zmq_context=self.zmq_context,
         )
 
     # ==================== Basic API ====================
