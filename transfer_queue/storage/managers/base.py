@@ -63,7 +63,12 @@ class StorageManager(ABC):
     """Base class for storage layer. It defines the interface for data operations and
     generally provides handshake & notification capabilities."""
 
-    def __init__(self, controller_info: ZMQServerInfo, config: DictConfig):
+    def __init__(
+        self,
+        controller_info: ZMQServerInfo,
+        config: DictConfig,
+        zmq_context: zmq.asyncio.Context | None = None,
+    ):
         self.storage_manager_id = f"TQ_STORAGE_{uuid4().hex[:8]}"
         self.config = config
         self.controller_info = controller_info
@@ -71,7 +76,11 @@ class StorageManager(ABC):
         # Handshake socket is sync (used only during initialization)
         self.controller_handshake_socket: zmq.Socket | None = None
 
-        self.zmq_context = zmq.asyncio.Context()
+        # SimpleStorage may borrow a client-owned context whose fixed native I/O
+        # thread pool is shared by controller and storage-unit request sockets.
+        # Other backends and standalone managers retain their own context.
+        self._owns_zmq_context = zmq_context is None
+        self.zmq_context = zmq_context or zmq.asyncio.Context()
         self._connect_to_controller()
 
         # Dedicated asyncio loop for ZMQ notify traffic, isolated from the caller's loop
@@ -391,9 +400,10 @@ class StorageManager(ABC):
             else:
                 logger.debug(f"[{self.storage_manager_id}]: Notify ZMQ thread shut down.")
 
-        # destroy(linger=0) force-closes any socket still open (e.g. from an interrupted
-        # request or the notify path) then terminates, so shutdown cannot hang on term().
-        self.zmq_context.destroy(linger=0)
+        if self._owns_zmq_context:
+            # destroy(linger=0) force-closes any socket still open (e.g. from an interrupted
+            # request or the notify path) then terminates, so shutdown cannot hang on term().
+            self.zmq_context.destroy(linger=0)
 
     def __del__(self):
         """Destructor to ensure resources are cleaned up."""
@@ -424,12 +434,21 @@ class StorageManagerFactory:
         return decorator
 
     @classmethod
-    def create(cls, manager_type: str, controller_info: ZMQServerInfo, config: dict[str, Any]) -> StorageManager:
+    def create(
+        cls,
+        manager_type: str,
+        controller_info: ZMQServerInfo,
+        config: dict[str, Any],
+        zmq_context: zmq.asyncio.Context | None = None,
+    ) -> StorageManager:
         """Create and return a StorageManager instance."""
         assert manager_type in cls._registry, (
             f"Unknown manager_type: {manager_type}. Supported managers include: {list(cls._registry.keys())}"
         )
-        return cls._registry[manager_type](controller_info, config)
+        manager_cls = cls._registry[manager_type]
+        if manager_type == "SimpleStorage" and zmq_context is not None:
+            return manager_cls(controller_info, config, zmq_context=zmq_context)
+        return manager_cls(controller_info, config)
 
 
 class KVStorageManager(StorageManager):
