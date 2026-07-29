@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import asyncio
+import inspect
 import itertools
 import os
 import threading
@@ -35,7 +36,13 @@ from torch import Tensor
 from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.clients.base import StorageClientFactory
 from transfer_queue.utils.logging_utils import get_logger
-from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo, create_zmq_socket
+from transfer_queue.utils.zmq_utils import (
+    ZMQMessage,
+    ZMQRequestType,
+    ZMQServerInfo,
+    create_zmq_context,
+    create_zmq_socket,
+)
 
 logger = get_logger(__name__)
 
@@ -63,7 +70,12 @@ class StorageManager(ABC):
     """Base class for storage layer. It defines the interface for data operations and
     generally provides handshake & notification capabilities."""
 
-    def __init__(self, controller_info: ZMQServerInfo, config: DictConfig):
+    def __init__(
+        self,
+        controller_info: ZMQServerInfo,
+        config: DictConfig,
+        zmq_context: zmq.asyncio.Context | None = None,
+    ):
         self.storage_manager_id = f"TQ_STORAGE_{uuid4().hex[:8]}"
         self.config = config
         self.controller_info = controller_info
@@ -71,7 +83,11 @@ class StorageManager(ABC):
         # Handshake socket is sync (used only during initialization)
         self.controller_handshake_socket: zmq.Socket | None = None
 
-        self.zmq_context = zmq.asyncio.Context()
+        # A manager created by TransferQueueClient borrows the client's context so
+        # controller and storage requests share one fixed native I/O-thread pool.
+        # Standalone managers create and own an equivalent long-lived context.
+        self._owns_zmq_context = zmq_context is None
+        self.zmq_context = zmq_context or create_zmq_context(config.get("zmq_io_threads", None))
         self._connect_to_controller()
 
         # Dedicated asyncio loop for ZMQ notify traffic, isolated from the caller's loop
@@ -391,9 +407,10 @@ class StorageManager(ABC):
             else:
                 logger.debug(f"[{self.storage_manager_id}]: Notify ZMQ thread shut down.")
 
-        # destroy(linger=0) force-closes any socket still open (e.g. from an interrupted
-        # request or the notify path) then terminates, so shutdown cannot hang on term().
-        self.zmq_context.destroy(linger=0)
+        if self._owns_zmq_context:
+            # destroy(linger=0) force-closes any socket still open (e.g. from an interrupted
+            # request or the notify path) then terminates, so shutdown cannot hang on term().
+            self.zmq_context.destroy(linger=0)
 
     def __del__(self):
         """Destructor to ensure resources are cleaned up."""
@@ -424,12 +441,21 @@ class StorageManagerFactory:
         return decorator
 
     @classmethod
-    def create(cls, manager_type: str, controller_info: ZMQServerInfo, config: dict[str, Any]) -> StorageManager:
+    def create(
+        cls,
+        manager_type: str,
+        controller_info: ZMQServerInfo,
+        config: dict[str, Any],
+        zmq_context: zmq.asyncio.Context | None = None,
+    ) -> StorageManager:
         """Create and return a StorageManager instance."""
         assert manager_type in cls._registry, (
             f"Unknown manager_type: {manager_type}. Supported managers include: {list(cls._registry.keys())}"
         )
-        return cls._registry[manager_type](controller_info, config)
+        manager_cls = cls._registry[manager_type]
+        if zmq_context is not None and "zmq_context" in inspect.signature(manager_cls).parameters:
+            return manager_cls(controller_info, config, zmq_context=zmq_context)
+        return manager_cls(controller_info, config)
 
 
 class KVStorageManager(StorageManager):
@@ -438,14 +464,19 @@ class KVStorageManager(StorageManager):
     It maps structured metadata (BatchMeta) to flat lists of keys and values for efficient KV operations.
     """
 
-    def __init__(self, controller_info: ZMQServerInfo, config: dict[str, Any]):
+    def __init__(
+        self,
+        controller_info: ZMQServerInfo,
+        config: dict[str, Any],
+        zmq_context: zmq.asyncio.Context | None = None,
+    ):
         """
         Initialize the KVStorageManager with configuration.
         """
         client_name = config.get("client_name", None)
         if client_name is None:
             raise ValueError("Missing client_name in config")
-        super().__init__(controller_info, config)
+        super().__init__(controller_info, config, zmq_context=zmq_context)
         self.storage_client = StorageClientFactory.create(client_name, config)
         self._multi_threads_executor: ThreadPoolExecutor | None = None
         self._executor_finalizer = weakref.finalize(self, self._shutdown_executor, self._multi_threads_executor)
