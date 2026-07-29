@@ -171,7 +171,7 @@ def test_context_rejects_invalid_io_thread_pool_size(echo_controller):
         )
 
 
-def test_client_shares_context_pool_with_storage_manager(echo_controller):
+def test_client_shares_context_pool_with_simple_storage_manager(echo_controller):
     client = AsyncTransferQueueClient(
         client_id="client_storage_ctx_pool",
         controller_info=echo_controller.zmq_server_info,
@@ -180,15 +180,35 @@ def test_client_shares_context_pool_with_storage_manager(echo_controller):
     config = {"client_name": "unused"}
 
     with patch("transfer_queue.client.StorageManagerFactory.create") as create_manager:
-        client.initialize_storage_manager("unused", config)
+        client.initialize_storage_manager("SimpleStorage", config)
 
     create_manager.assert_called_once_with(
-        "unused",
+        "SimpleStorage",
         controller_info=echo_controller.zmq_server_info,
         config=config,
         zmq_context=client.zmq_context,
     )
     assert config == {"client_name": "unused"}
+
+    client.close()
+
+
+def test_client_does_not_pass_context_to_other_storage_backends(echo_controller):
+    client = AsyncTransferQueueClient(
+        client_id="client_other_storage_ctx",
+        controller_info=echo_controller.zmq_server_info,
+        zmq_io_threads=4,
+    )
+    config = {"client_name": "unused"}
+
+    with patch("transfer_queue.client.StorageManagerFactory.create") as create_manager:
+        client.initialize_storage_manager("OtherStorage", config)
+
+    create_manager.assert_called_once_with(
+        "OtherStorage",
+        controller_info=echo_controller.zmq_server_info,
+        config=config,
+    )
 
     client.close()
 
