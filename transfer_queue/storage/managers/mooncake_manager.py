@@ -15,8 +15,6 @@
 
 from typing import Any
 
-import zmq.asyncio
-
 from transfer_queue.storage.managers.base import KVStorageManager, StorageManagerFactory
 from transfer_queue.utils.zmq_utils import ZMQServerInfo
 
@@ -31,11 +29,6 @@ class MooncakeStorageManager(KVStorageManager):
     pybind bindings.
     """
 
-    def __init__(
-        self,
-        controller_info: ZMQServerInfo,
-        config: dict[str, Any],
-        zmq_context: zmq.asyncio.Context | None = None,
-    ):
+    def __init__(self, controller_info: ZMQServerInfo, config: dict[str, Any]):
         config["client_name"] = "MooncakeStoreClient"
-        super().__init__(controller_info, config, zmq_context=zmq_context)
+        super().__init__(controller_info, config)

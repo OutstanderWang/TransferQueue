@@ -31,7 +31,6 @@ from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
     ZMQServerInfo,
-    create_zmq_context,
     with_zmq_socket,
 )
 
@@ -59,15 +58,12 @@ class AsyncTransferQueueClient:
         self,
         client_id: str,
         controller_info: ZMQServerInfo,
-        zmq_io_threads: int | None = None,
     ):
         """Initialize the asynchronous TransferQueue client.
 
         Args:
             client_id: Unique identifier for this client instance
             controller_info: Single controller ZMQ server information
-            zmq_io_threads: Size of the long-lived ZMQ context's native I/O-thread
-                pool. Defaults to ``TQ_ZMQ_IO_THREADS`` (8).
         """
         if controller_info is None:
             raise ValueError("controller_info cannot be None")
@@ -75,11 +71,10 @@ class AsyncTransferQueueClient:
             raise TypeError(f"controller_info must be ZMQServerInfo, got {type(controller_info)}")
         self.client_id = client_id
         self._controller: ZMQServerInfo = controller_info
-        self._zmq_io_threads = zmq_io_threads
-        # One long-lived ZMQ context per client. Its fixed native I/O-thread pool is shared
-        # by all concurrent RPC sockets; sockets remain per-request because ZMQ sockets are
-        # not thread-safe. The context is terminated once in close().
-        self.zmq_context = create_zmq_context(zmq_io_threads)
+        # Long-lived ZMQ context shared by all controller RPCs on this client. Contexts are
+        # thread-safe and event-loop-agnostic; each RPC creates and closes its own DEALER
+        # socket from this context (see with_controller_socket). Terminated once in close().
+        self.zmq_context = zmq.asyncio.Context()
         logger.info(f"[{self.client_id}]: Registered Controller server {controller_info.id} at {controller_info.ip}")
 
     def initialize_storage_manager(
@@ -98,10 +93,7 @@ class AsyncTransferQueueClient:
 
         """
         self.storage_manager = StorageManagerFactory.create(
-            manager_type,
-            controller_info=self._controller,
-            config=config,
-            zmq_context=self.zmq_context,
+            manager_type, controller_info=self._controller, config=config
         )
 
     # ==================== Basic API ====================
@@ -1251,20 +1243,16 @@ class TransferQueueClient(AsyncTransferQueueClient):
         self,
         client_id: str,
         controller_info: ZMQServerInfo,
-        zmq_io_threads: int | None = None,
     ):
         """Initialize the synchronous TransferQueue client.
 
         Args:
             client_id: Unique identifier for this client instance
             controller_info: Single controller ZMQ server information
-            zmq_io_threads: Size of the long-lived ZMQ context's native I/O-thread
-                pool. Defaults to ``TQ_ZMQ_IO_THREADS`` (8).
         """
         super().__init__(
             client_id,
             controller_info,
-            zmq_io_threads,
         )
 
         # create new event loop in a separate thread

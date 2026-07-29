@@ -13,7 +13,6 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import os
 import socket
 import time
 from dataclasses import dataclass
@@ -266,22 +265,6 @@ def get_free_port(ip: str) -> int:
         return sock.getsockname()[1]
 
 
-TQ_ZMQ_IO_THREADS = int(os.environ.get("TQ_ZMQ_IO_THREADS", 8))
-
-
-def create_zmq_context(io_threads: int | None = None) -> "zmq.asyncio.Context":
-    """Create a long-lived async ZMQ context with a fixed I/O-thread pool.
-
-    A ZMQ context owns the native I/O-thread pool used by all sockets created from
-    that context. Keeping one context per owner lets concurrent request sockets share
-    the whole pool without creating or terminating contexts per request.
-    """
-    pool_size = TQ_ZMQ_IO_THREADS if io_threads is None else io_threads
-    if pool_size < 1:
-        raise ValueError(f"ZMQ I/O thread pool size must be at least 1, got {pool_size}")
-    return zmq.asyncio.Context(io_threads=pool_size)
-
-
 def create_zmq_socket(
     ctx: zmq.Context,
     socket_type: Any,
@@ -349,9 +332,8 @@ def with_zmq_socket(
     terminate a context here -- per-call context churn corrupts libzmq's signaler file
     descriptors under concurrency (Bad file descriptor / SIGABRT) and can hang on term().
     Contexts are thread-safe and event-loop-agnostic, so a single shared context is safe
-    even when decorated methods run on different loops/threads. The context's fixed native
-    I/O-thread pool is shared by all request sockets; each socket is created and fully used
-    within one awaited call on one loop.
+    even when decorated methods run on different loops/threads; each socket is created and
+    fully used within one awaited call on one loop.
 
     Args:
         socket_name: Socket port key in ``ZMQServerInfo.ports``.
