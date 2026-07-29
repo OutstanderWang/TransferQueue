@@ -27,6 +27,7 @@ that the context is never terminated between calls, only when the client is clos
 
 import asyncio
 from threading import Thread
+from unittest.mock import patch
 
 import pytest
 import zmq
@@ -34,6 +35,7 @@ import zmq
 import transfer_queue.utils.zmq_utils as zmq_utils
 from transfer_queue.client import AsyncTransferQueueClient
 from transfer_queue.metadata import BatchMeta
+from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo
 
@@ -144,6 +146,89 @@ async def test_shared_context_reused_across_concurrent_calls(echo_controller, mo
     assert all(ctx is client.zmq_context for ctx in seen_contexts)
     # The shared context must NOT have been terminated by any call.
     assert not client.zmq_context.closed
+
+    client.close()
+
+
+def test_client_context_has_fixed_io_thread_pool(echo_controller):
+    client = AsyncTransferQueueClient(
+        client_id="client_fixed_context_pool",
+        controller_info=echo_controller.zmq_server_info,
+        simple_storage_zmq_io_threads=4,
+    )
+
+    assert client.zmq_context.get(zmq.IO_THREADS) == 4
+
+    client.close()
+
+
+def test_client_rejects_invalid_context_pool_size(echo_controller):
+    with pytest.raises(ValueError, match="at least 1"):
+        AsyncTransferQueueClient(
+            client_id="client_invalid_context_pool",
+            controller_info=echo_controller.zmq_server_info,
+            simple_storage_zmq_io_threads=0,
+        )
+
+
+def test_simple_storage_borrows_client_context(echo_controller):
+    client = AsyncTransferQueueClient(
+        client_id="client_simple_storage_context",
+        controller_info=echo_controller.zmq_server_info,
+    )
+    config = {"zmq_info": {}}
+
+    with patch("transfer_queue.client.StorageManagerFactory.create") as create_manager:
+        client.initialize_storage_manager("SimpleStorage", config)
+
+    create_manager.assert_called_once_with(
+        "SimpleStorage",
+        controller_info=echo_controller.zmq_server_info,
+        config=config,
+        zmq_context=client.zmq_context,
+    )
+
+    client.close()
+
+
+def test_simple_storage_does_not_destroy_borrowed_context(echo_controller):
+    client = AsyncTransferQueueClient(
+        client_id="client_borrowed_context_lifecycle",
+        controller_info=echo_controller.zmq_server_info,
+    )
+
+    with patch("transfer_queue.storage.managers.base.StorageManager._connect_to_controller"):
+        manager = AsyncSimpleStorageManager(
+            echo_controller.zmq_server_info,
+            {"zmq_info": {"storage_0": echo_controller.zmq_server_info}},
+            zmq_context=client.zmq_context,
+        )
+
+    assert manager.zmq_context is client.zmq_context
+    assert not manager._owns_zmq_context
+
+    manager.close()
+    assert not client.zmq_context.closed
+
+    client.close()
+    assert client.zmq_context.closed
+
+
+def test_other_backends_do_not_borrow_client_context(echo_controller):
+    client = AsyncTransferQueueClient(
+        client_id="client_other_storage_context",
+        controller_info=echo_controller.zmq_server_info,
+    )
+    config = {"client_name": "unused"}
+
+    with patch("transfer_queue.client.StorageManagerFactory.create") as create_manager:
+        client.initialize_storage_manager("OtherStorage", config)
+
+    create_manager.assert_called_once_with(
+        "OtherStorage",
+        controller_info=echo_controller.zmq_server_info,
+        config=config,
+    )
 
     client.close()
 

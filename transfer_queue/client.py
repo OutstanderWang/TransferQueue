@@ -37,6 +37,7 @@ from transfer_queue.utils.zmq_utils import (
 logger = get_logger(__name__)
 
 TQ_NUM_THREADS = int(os.environ.get("TQ_NUM_THREADS", 8))
+TQ_SIMPLE_STORAGE_ZMQ_IO_THREADS = int(os.environ.get("TQ_SIMPLE_STORAGE_ZMQ_IO_THREADS", 8))
 
 # Pre-bound decorator for controller socket operations.
 with_controller_socket = with_zmq_socket(
@@ -58,12 +59,16 @@ class AsyncTransferQueueClient:
         self,
         client_id: str,
         controller_info: ZMQServerInfo,
+        simple_storage_zmq_io_threads: int | None = None,
     ):
         """Initialize the asynchronous TransferQueue client.
 
         Args:
             client_id: Unique identifier for this client instance
             controller_info: Single controller ZMQ server information
+            simple_storage_zmq_io_threads: Fixed size of the client context's
+                native I/O-thread pool. Defaults to
+                ``TQ_SIMPLE_STORAGE_ZMQ_IO_THREADS`` (8).
         """
         if controller_info is None:
             raise ValueError("controller_info cannot be None")
@@ -71,10 +76,20 @@ class AsyncTransferQueueClient:
             raise TypeError(f"controller_info must be ZMQServerInfo, got {type(controller_info)}")
         self.client_id = client_id
         self._controller: ZMQServerInfo = controller_info
-        # Long-lived ZMQ context shared by all controller RPCs on this client. Contexts are
-        # thread-safe and event-loop-agnostic; each RPC creates and closes its own DEALER
-        # socket from this context (see with_controller_socket). Terminated once in close().
-        self.zmq_context = zmq.asyncio.Context()
+        # One long-lived context per client. Its fixed native I/O-thread pool is shared
+        # by all controller RPCs and, for SimpleStorage only, storage-unit requests.
+        # Sockets remain per-request because ZMQ sockets are not thread-safe.
+        io_threads = (
+            TQ_SIMPLE_STORAGE_ZMQ_IO_THREADS
+            if simple_storage_zmq_io_threads is None
+            else simple_storage_zmq_io_threads
+        )
+        if io_threads < 1:
+            raise ValueError(
+                "SimpleStorage ZMQ I/O thread pool size must be at least 1, "
+                f"got {io_threads}"
+            )
+        self.zmq_context = zmq.asyncio.Context(io_threads=io_threads)
         logger.info(f"[{self.client_id}]: Registered Controller server {controller_info.id} at {controller_info.ip}")
 
     def initialize_storage_manager(
@@ -92,8 +107,14 @@ class AsyncTransferQueueClient:
                     - zmq_info: ZMQ server information about the storage units
 
         """
+        create_kwargs = {}
+        if manager_type == "SimpleStorage":
+            create_kwargs["zmq_context"] = self.zmq_context
         self.storage_manager = StorageManagerFactory.create(
-            manager_type, controller_info=self._controller, config=config
+            manager_type,
+            controller_info=self._controller,
+            config=config,
+            **create_kwargs,
         )
 
     # ==================== Basic API ====================
@@ -1243,16 +1264,21 @@ class TransferQueueClient(AsyncTransferQueueClient):
         self,
         client_id: str,
         controller_info: ZMQServerInfo,
+        simple_storage_zmq_io_threads: int | None = None,
     ):
         """Initialize the synchronous TransferQueue client.
 
         Args:
             client_id: Unique identifier for this client instance
             controller_info: Single controller ZMQ server information
+            simple_storage_zmq_io_threads: Fixed size of the client context's
+                native I/O-thread pool. Defaults to
+                ``TQ_SIMPLE_STORAGE_ZMQ_IO_THREADS`` (8).
         """
         super().__init__(
             client_id,
             controller_info,
+            simple_storage_zmq_io_threads,
         )
 
         # create new event loop in a separate thread
