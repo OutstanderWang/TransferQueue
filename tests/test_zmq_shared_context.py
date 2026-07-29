@@ -21,13 +21,12 @@ libzmq signaler file descriptors and crashed the process (``signaler.cpp`` Bad f
 descriptor -> SIGABRT). The fix makes the decorator reuse the owner's long-lived context
 (``get_context``) and only create/close the DEALER socket per call.
 
-These tests assert that concurrent decorated calls all reuse the SAME fixed-size context
-pool and that the context is never terminated between calls, only when the client is closed.
+These tests assert that concurrent decorated calls all reuse the SAME context object and
+that the context is never terminated between calls, only when the client is closed.
 """
 
 import asyncio
 from threading import Thread
-from unittest.mock import patch
 
 import pytest
 import zmq
@@ -145,50 +144,6 @@ async def test_shared_context_reused_across_concurrent_calls(echo_controller, mo
     assert all(ctx is client.zmq_context for ctx in seen_contexts)
     # The shared context must NOT have been terminated by any call.
     assert not client.zmq_context.closed
-
-    client.close()
-
-
-def test_context_uses_configured_fixed_io_thread_pool(echo_controller):
-    """All sockets from a client share the configured native ZMQ I/O-thread pool."""
-    client = AsyncTransferQueueClient(
-        client_id="client_fixed_ctx_pool",
-        controller_info=echo_controller.zmq_server_info,
-        zmq_io_threads=4,
-    )
-
-    assert client.zmq_context.get(zmq.IO_THREADS) == 4
-
-    client.close()
-
-
-def test_context_rejects_invalid_io_thread_pool_size(echo_controller):
-    with pytest.raises(ValueError, match="at least 1"):
-        AsyncTransferQueueClient(
-            client_id="client_invalid_ctx_pool",
-            controller_info=echo_controller.zmq_server_info,
-            zmq_io_threads=0,
-        )
-
-
-def test_client_shares_context_pool_with_storage_manager(echo_controller):
-    client = AsyncTransferQueueClient(
-        client_id="client_storage_ctx_pool",
-        controller_info=echo_controller.zmq_server_info,
-        zmq_io_threads=4,
-    )
-    config = {"client_name": "unused"}
-
-    with patch("transfer_queue.client.StorageManagerFactory.create") as create_manager:
-        client.initialize_storage_manager("unused", config)
-
-    create_manager.assert_called_once_with(
-        "unused",
-        controller_info=echo_controller.zmq_server_info,
-        config=config,
-        zmq_context=client.zmq_context,
-    )
-    assert config == {"client_name": "unused"}
 
     client.close()
 
