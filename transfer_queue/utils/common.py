@@ -19,6 +19,7 @@ from contextlib import contextmanager
 import psutil
 import ray
 import torch
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from transfer_queue.utils.logging_utils import get_logger
 
@@ -42,6 +43,33 @@ def get_placement_group(num_ray_actors: int, num_cpus_per_actor: int = 1):
     placement_group = ray.util.placement_group([bundle for _ in range(num_ray_actors)], strategy="SPREAD")
     ray.get(placement_group.ready())
     return placement_group
+
+
+def get_node_round_robin_scheduling_strategies(num_actors: int) -> list[NodeAffinitySchedulingStrategy]:
+    """
+    Compute one scheduling strategy per actor that round-robins actors across all
+    currently alive Ray nodes, in order.
+
+    Unlike a placement group with SPREAD (best-effort) or STRICT_SPREAD (fails when
+    num_actors > num_nodes), this guarantees each node is assigned floor(num_actors /
+    num_nodes) or ceil(num_actors / num_nodes) actors, regardless of how num_actors
+    compares to the number of nodes.
+
+    Args:
+        num_actors (int): Number of Ray actors to schedule.
+
+    Returns:
+        list[NodeAffinitySchedulingStrategy]: One scheduling strategy per actor.
+    """
+    nodes = ray.nodes()
+    alive_node_ids = sorted(node["NodeID"] for node in nodes if node.get("Alive", False))
+    if not alive_node_ids:
+        raise RuntimeError("No alive Ray nodes found. Is Ray initialized?")
+
+    return [
+        NodeAffinitySchedulingStrategy(node_id=alive_node_ids[i % len(alive_node_ids)], soft=False)
+        for i in range(num_actors)
+    ]
 
 
 @contextmanager
