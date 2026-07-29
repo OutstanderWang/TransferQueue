@@ -73,8 +73,13 @@ class AsyncSimpleStorageManager(StorageManager):
     instances using ZMQ communication and dynamic socket management.
     """
 
-    def __init__(self, controller_info: ZMQServerInfo, config: DictConfig):
-        super().__init__(controller_info, config)
+    def __init__(
+        self,
+        controller_info: ZMQServerInfo,
+        config: DictConfig,
+        zmq_context: zmq.asyncio.Context | None = None,
+    ):
+        super().__init__(controller_info, config, zmq_context=zmq_context)
 
         self.config = config
         server_infos: ZMQServerInfo | dict[str, ZMQServerInfo] | None = config.get("zmq_info", None)
