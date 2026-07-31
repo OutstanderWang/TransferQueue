@@ -80,15 +80,10 @@ class AsyncTransferQueueClient:
         # by all controller RPCs and, for SimpleStorage only, storage-unit requests.
         # Sockets remain per-request because ZMQ sockets are not thread-safe.
         io_threads = (
-            TQ_SIMPLE_STORAGE_ZMQ_IO_THREADS
-            if simple_storage_zmq_io_threads is None
-            else simple_storage_zmq_io_threads
+            TQ_SIMPLE_STORAGE_ZMQ_IO_THREADS if simple_storage_zmq_io_threads is None else simple_storage_zmq_io_threads
         )
         if io_threads < 1:
-            raise ValueError(
-                "SimpleStorage ZMQ I/O thread pool size must be at least 1, "
-                f"got {io_threads}"
-            )
+            raise ValueError(f"SimpleStorage ZMQ I/O thread pool size must be at least 1, got {io_threads}")
         self.zmq_context = zmq.asyncio.Context(io_threads=io_threads)
         logger.info(f"[{self.client_id}]: Registered Controller server {controller_info.id} at {controller_info.ip}")
 
