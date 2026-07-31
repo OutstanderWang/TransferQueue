@@ -14,12 +14,15 @@
 # limitations under the License.
 
 import logging
+from uuid import uuid4
 
 import pytest
 import ray
 import torch
+import zmq
 
 from transfer_queue.controller import TransferQueueController
+from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, create_zmq_socket
 
 # Set up logging
 logging.basicConfig(level=logging.INFO)
@@ -1263,3 +1266,126 @@ class TestTransferQueueControllerCheckpoint:
             ray.get(tq_controller.load_checkpoint.remote(missing))
 
         print("✓ load_checkpoint raises on missing file")
+
+
+class TestTransferQueueControllerBadRequests:
+    """The request loop must survive requests it cannot decode, does not handle, or fails on.
+
+    Any of these used to propagate out of ``_process_request``, killing
+    ``TransferQueueControllerProcessRequestThread``. The controller then stopped answering
+    anything at all for the rest of the run, so one malformed message took down the job.
+    Every bad request must now get a REQUEST_ERROR reply: requesters block on recv until a
+    reply arrives, so silently dropping a request would hang the caller instead.
+    """
+
+    RECV_TIMEOUT_MS = 5000
+
+    @staticmethod
+    def _connect(ctx, tq_controller):
+        info = ray.get(tq_controller.get_zmq_server_info.remote())
+        sock = create_zmq_socket(ctx, zmq.DEALER, info.ip, identity=f"probe-{uuid4().hex[:8]}".encode())
+        sock.connect(info.to_addr("request_handle_socket"))
+        sock.setsockopt(zmq.RCVTIMEO, TestTransferQueueControllerBadRequests.RECV_TIMEOUT_MS)
+        sock.setsockopt(zmq.SNDTIMEO, TestTransferQueueControllerBadRequests.RECV_TIMEOUT_MS)
+        return sock
+
+    @staticmethod
+    def _list_partitions_request():
+        return ZMQMessage.create(
+            request_type=ZMQRequestType.GET_LIST_PARTITIONS,
+            sender_id="probe",
+            body={},
+        ).serialize()
+
+    @classmethod
+    def _assert_still_serving(cls, sock):
+        """A well-formed request must still get its own correct reply."""
+        sock.send_multipart(cls._list_partitions_request())
+        reply = ZMQMessage.deserialize(sock.recv_multipart(copy=False))
+        assert reply.request_type == ZMQRequestType.LIST_PARTITIONS_RESPONSE
+
+    def test_controller_survives_undecodable_request(self, ray_setup):
+        """An empty leading frame is what a shifted multipart boundary looks like on the wire."""
+        tq_controller = TransferQueueController.remote()
+        ctx = zmq.Context()
+        sock = None
+        try:
+            sock = self._connect(ctx, tq_controller)
+            self._assert_still_serving(sock)
+
+            # Frame 0 must be the msgpack header; prepending an empty frame shifts every
+            # boundary by one, which is exactly the corruption seen in production.
+            sock.send_multipart([b"", *self._list_partitions_request()])
+            reply = ZMQMessage.deserialize(sock.recv_multipart(copy=False))
+            assert reply.request_type == ZMQRequestType.REQUEST_ERROR
+            assert "undecodable" in reply.body["message"]
+
+            self._assert_still_serving(sock)
+            print("✓ controller still serving after an undecodable request")
+        finally:
+            if sock is not None and not sock.closed:
+                sock.close(linger=0)
+            ctx.term()
+
+    def test_controller_rejects_unhandled_request_type(self, ray_setup):
+        """PUT_DATA is a storage-unit request; the controller has no branch for it.
+
+        Without the guard, the reply carried whatever response the previous loop iteration
+        had left in ``response_msg``, so this probe received a stale LIST_PARTITIONS_RESPONSE.
+        Now the requester gets a REQUEST_ERROR it can react to instead of a stale reply.
+        """
+        tq_controller = TransferQueueController.remote()
+        ctx = zmq.Context()
+        sock = None
+        try:
+            sock = self._connect(ctx, tq_controller)
+            # Leaves a LIST_PARTITIONS_RESPONSE behind as the previous iteration's response.
+            self._assert_still_serving(sock)
+
+            sock.send_multipart(
+                ZMQMessage.create(
+                    request_type=ZMQRequestType.PUT_DATA,
+                    sender_id="probe",
+                    body={},
+                ).serialize()
+            )
+            reply = ZMQMessage.deserialize(sock.recv_multipart(copy=False))
+            assert reply.request_type == ZMQRequestType.REQUEST_ERROR
+            assert "no handler" in reply.body["message"]
+
+            self._assert_still_serving(sock)
+            print("✓ controller rejected an unhandled request type without replaying a stale response")
+        finally:
+            if sock is not None and not sock.closed:
+                sock.close(linger=0)
+            ctx.term()
+
+    def test_controller_replies_error_when_handler_raises(self, ray_setup):
+        """A GET_META body missing its keys makes the handler raise KeyError.
+
+        The exception used to kill the request thread, hanging every client. Now the
+        requester gets a REQUEST_ERROR and the loop keeps serving subsequent requests.
+        """
+        tq_controller = TransferQueueController.remote()
+        ctx = zmq.Context()
+        sock = None
+        try:
+            sock = self._connect(ctx, tq_controller)
+
+            sock.send_multipart(
+                ZMQMessage.create(
+                    request_type=ZMQRequestType.GET_META,
+                    sender_id="probe",
+                    body={},  # no data_fields/batch_size/partition_id -> KeyError in the handler
+                ).serialize()
+            )
+            reply = ZMQMessage.deserialize(sock.recv_multipart(copy=False))
+            assert reply.request_type == ZMQRequestType.REQUEST_ERROR
+            assert "GET_META failed" in reply.body["message"]
+
+            self._assert_still_serving(sock)
+            print("✓ controller replied with an error when the handler raised")
+        finally:
+            if sock is not None and not sock.closed:
+                sock.close(linger=0)
+            ctx.term()
