@@ -33,8 +33,9 @@ import pytest
 import zmq
 
 import transfer_queue.utils.zmq_utils as zmq_utils
-from transfer_queue.client import AsyncTransferQueueClient
+from transfer_queue.client import AsyncTransferQueueClient, TransferQueueClient
 from transfer_queue.metadata import BatchMeta
+from transfer_queue.storage.managers.base import KVStorageManager
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo
@@ -154,7 +155,7 @@ def test_client_context_has_fixed_io_thread_pool(echo_controller):
     client = AsyncTransferQueueClient(
         client_id="client_fixed_context_pool",
         controller_info=echo_controller.zmq_server_info,
-        simple_storage_zmq_io_threads=4,
+        zmq_io_threads=4,
     )
 
     assert client.zmq_context.get(zmq.IO_THREADS) == 4
@@ -167,7 +168,7 @@ def test_client_rejects_invalid_context_pool_size(echo_controller):
         AsyncTransferQueueClient(
             client_id="client_invalid_context_pool",
             controller_info=echo_controller.zmq_server_info,
-            simple_storage_zmq_io_threads=0,
+            zmq_io_threads=0,
         )
 
 
@@ -214,7 +215,8 @@ def test_simple_storage_does_not_destroy_borrowed_context(echo_controller):
     assert client.zmq_context.closed
 
 
-def test_other_backends_do_not_borrow_client_context(echo_controller):
+def test_factory_is_backend_agnostic(echo_controller):
+    """The client offers its context to every backend uniformly, naming none of them."""
     client = AsyncTransferQueueClient(
         client_id="client_other_storage_context",
         controller_info=echo_controller.zmq_server_info,
@@ -228,7 +230,38 @@ def test_other_backends_do_not_borrow_client_context(echo_controller):
         "OtherStorage",
         controller_info=echo_controller.zmq_server_info,
         config=config,
+        zmq_context=client.zmq_context,
     )
+
+    client.close()
+
+
+def test_kv_backends_keep_own_context(echo_controller):
+    """KV managers accept the shared context but deliberately keep an independent one.
+
+    They move bulk data through their own SDKs and use ZMQ only for the controller
+    notify/handshake path, so they must not draw on the client's socket budget.
+    """
+    client = AsyncTransferQueueClient(
+        client_id="client_kv_own_context",
+        controller_info=echo_controller.zmq_server_info,
+    )
+
+    with (
+        patch("transfer_queue.storage.managers.base.StorageManager._connect_to_controller"),
+        patch("transfer_queue.storage.managers.base.StorageClientFactory.create"),
+    ):
+        manager = KVStorageManager(
+            echo_controller.zmq_server_info,
+            {"client_name": "unused"},
+            zmq_context=client.zmq_context,
+        )
+
+    assert manager.zmq_context is not client.zmq_context
+    assert manager._owns_zmq_context
+
+    manager.close()
+    assert not client.zmq_context.closed
 
     client.close()
 
@@ -251,3 +284,55 @@ async def test_close_destroys_context(echo_controller):
 
     client.close()
     assert client.zmq_context.closed
+
+
+def test_client_applies_max_sockets(echo_controller):
+    """The per-context socket ceiling is configurable, since it is now shared per client."""
+    client = AsyncTransferQueueClient(
+        client_id="client_max_sockets",
+        controller_info=echo_controller.zmq_server_info,
+        zmq_max_sockets=2048,
+    )
+
+    assert client.zmq_context.get(zmq.MAX_SOCKETS) == 2048
+
+    client.close()
+
+
+def test_client_rejects_max_sockets_above_build_limit(echo_controller):
+    """Values above this libzmq build's ZMQ_SOCKET_LIMIT are rejected up front."""
+    probe = zmq.Context()
+    socket_limit = probe.get(zmq.SOCKET_LIMIT)
+    probe.term()
+
+    with pytest.raises(ValueError, match="ZMQ_SOCKET_LIMIT"):
+        AsyncTransferQueueClient(
+            client_id="client_max_sockets_too_big",
+            controller_info=echo_controller.zmq_server_info,
+            zmq_max_sockets=socket_limit + 1,
+        )
+
+
+def test_close_skips_destroy_while_loop_thread_alive(echo_controller):
+    """destroy() is not thread-safe, so a stuck loop thread must veto it.
+
+    TransferQueueClient.close() joins its loop thread with a timeout that only warns on
+    expiry. Falling through to destroy() with that thread still holding sockets is the
+    documented hazard, so the context is leaked instead.
+    """
+    client = TransferQueueClient(
+        client_id="client_stuck_thread",
+        controller_info=echo_controller.zmq_server_info,
+    )
+    context = client.zmq_context
+
+    # Simulate a loop thread that outlived its join timeout.
+    with patch.object(client._thread, "is_alive", return_value=True):
+        assert client._can_destroy_zmq_context() is False
+        client.close()
+
+    assert not context.closed, "context must be leaked, not destroyed unsafely"
+
+    # With the thread genuinely gone, the veto lifts.
+    assert client._can_destroy_zmq_context() is True
+    context.destroy(linger=0)
