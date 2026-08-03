@@ -41,10 +41,10 @@ TQ_NUM_THREADS = int(os.environ.get("TQ_NUM_THREADS", 8))
 # controller RPC (all backends) and, for SimpleStorage, storage-unit requests too,
 # so this knob is client-scoped rather than backend-scoped.
 TQ_CLIENT_ZMQ_IO_THREADS = int(os.environ.get("TQ_CLIENT_ZMQ_IO_THREADS", 8))
-# Per-context socket ceiling. Unset means libzmq's default (1023). Because the context
-# is now shared per client instead of created per call, all in-flight sockets draw on a
-# single budget; raise this if a large num_data_storage_units fan-out exhausts it.
-TQ_CLIENT_ZMQ_MAX_SOCKETS = os.environ.get("TQ_CLIENT_ZMQ_MAX_SOCKETS")
+# Per-context socket ceiling. Unset (or empty) means libzmq's default (1023). Because the
+# context is now shared per client instead of created per call, all in-flight sockets draw
+# on a single budget; raise this if a large num_data_storage_units fan-out exhausts it.
+TQ_CLIENT_ZMQ_MAX_SOCKETS = os.environ.get("TQ_CLIENT_ZMQ_MAX_SOCKETS") or None
 
 # Pre-bound decorator for controller socket operations.
 with_controller_socket = with_zmq_socket(
@@ -97,11 +97,15 @@ class AsyncTransferQueueClient:
             raise ValueError(f"Client ZMQ I/O thread pool size must be at least 1, got {io_threads}")
         self.zmq_context = zmq.asyncio.Context(io_threads=io_threads)
 
-        max_sockets = (
-            int(TQ_CLIENT_ZMQ_MAX_SOCKETS)
-            if zmq_max_sockets is None and TQ_CLIENT_ZMQ_MAX_SOCKETS is not None
-            else zmq_max_sockets
-        )
+        max_sockets = zmq_max_sockets
+        if max_sockets is None and TQ_CLIENT_ZMQ_MAX_SOCKETS is not None:
+            try:
+                max_sockets = int(TQ_CLIENT_ZMQ_MAX_SOCKETS)
+            except ValueError as e:
+                # Name the variable: a bare int() error gives no clue which knob is wrong.
+                raise ValueError(
+                    f"TQ_CLIENT_ZMQ_MAX_SOCKETS must be an integer, got {TQ_CLIENT_ZMQ_MAX_SOCKETS!r}"
+                ) from e
         if max_sockets is not None:
             socket_limit = self.zmq_context.get(zmq.SOCKET_LIMIT)
             if not 1 <= max_sockets <= socket_limit:

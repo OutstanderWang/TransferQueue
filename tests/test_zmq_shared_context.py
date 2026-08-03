@@ -35,7 +35,7 @@ import zmq
 import transfer_queue.utils.zmq_utils as zmq_utils
 from transfer_queue.client import AsyncTransferQueueClient, TransferQueueClient
 from transfer_queue.metadata import BatchMeta
-from transfer_queue.storage.managers.base import KVStorageManager
+from transfer_queue.storage.managers.base import KVStorageManager, StorageManager, StorageManagerFactory
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo
@@ -266,6 +266,69 @@ def test_kv_backends_keep_own_context(echo_controller):
     client.close()
 
 
+def test_factory_forwards_kwargs_to_registered_manager(echo_controller):
+    """The real factory forwards **kwargs verbatim, knowing no backend by name.
+
+    The other factory test patches ``create`` out, so this one exercises the real
+    dispatch: a third-party manager registered from outside this package must receive
+    ``zmq_context`` without the factory special-casing its name. A regression to the old
+    ``if manager_type == "SimpleStorage"`` branch would silently drop the kwarg here, and
+    a manager whose signature drifts would raise TypeError -- neither of which mypy can
+    catch through ``**kwargs: Any``.
+    """
+    received = {}
+
+    @StorageManagerFactory.register("THIRD_PARTY_PROBE")
+    class ThirdPartyManager(StorageManager):
+        def __init__(self, controller_info, config, zmq_context=None):
+            received["zmq_context"] = zmq_context
+            received["config"] = config
+            super().__init__(controller_info, config, zmq_context=zmq_context)
+
+        def _connect_to_controller(self):
+            pass
+
+        def _do_handshake_with_controller(self):
+            pass
+
+        async def put_data(self, *args, **kwargs):
+            return None
+
+        async def get_data(self, *args, **kwargs):
+            return None
+
+        async def clear_data(self, *args, **kwargs):
+            return None
+
+        async def notify_data_update(self, *args, **kwargs):
+            return None
+
+    try:
+        client = AsyncTransferQueueClient(
+            client_id="client_third_party_factory",
+            controller_info=echo_controller.zmq_server_info,
+        )
+        config = {"marker": "forwarded"}
+
+        client.initialize_storage_manager("THIRD_PARTY_PROBE", config)
+
+        # The kwarg survived dispatch through the unpatched factory...
+        assert received["zmq_context"] is client.zmq_context
+        assert received["config"] == config
+        # ...and a manager that opts in genuinely borrows rather than re-creating.
+        assert client.storage_manager.zmq_context is client.zmq_context
+        assert not client.storage_manager._owns_zmq_context
+
+        # A borrower must not tear down a context it does not own.
+        client.storage_manager.close()
+        assert not client.zmq_context.closed
+
+        client.close()
+        assert client.zmq_context.closed
+    finally:
+        StorageManagerFactory._registry.pop("THIRD_PARTY_PROBE", None)
+
+
 @pytest.mark.asyncio
 async def test_close_destroys_context(echo_controller):
     """close() must terminate the shared context exactly once (no leak, no hang)."""
@@ -311,6 +374,61 @@ def test_client_rejects_max_sockets_above_build_limit(echo_controller):
             controller_info=echo_controller.zmq_server_info,
             zmq_max_sockets=socket_limit + 1,
         )
+
+
+def test_max_sockets_from_env_var(echo_controller):
+    """TQ_CLIENT_ZMQ_MAX_SOCKETS configures the ceiling without touching call sites.
+
+    The env var is the deployment-facing knob (the kwarg requires editing code), so it
+    needs its own coverage. Patched at the module constant because it is read at import.
+    """
+    with patch("transfer_queue.client.TQ_CLIENT_ZMQ_MAX_SOCKETS", "4096"):
+        client = AsyncTransferQueueClient(
+            client_id="client_max_sockets_env",
+            controller_info=echo_controller.zmq_server_info,
+        )
+
+    assert client.zmq_context.get(zmq.MAX_SOCKETS) == 4096
+    client.close()
+
+
+def test_explicit_max_sockets_overrides_env_var(echo_controller):
+    """An explicit kwarg wins over the env var, matching the io_threads precedence."""
+    with patch("transfer_queue.client.TQ_CLIENT_ZMQ_MAX_SOCKETS", "4096"):
+        client = AsyncTransferQueueClient(
+            client_id="client_max_sockets_precedence",
+            controller_info=echo_controller.zmq_server_info,
+            zmq_max_sockets=2048,
+        )
+
+    assert client.zmq_context.get(zmq.MAX_SOCKETS) == 2048
+    client.close()
+
+
+def test_unset_max_sockets_leaves_libzmq_default(echo_controller):
+    """Opt-in only: with nothing configured, libzmq's own default must be untouched."""
+    probe = zmq.Context()
+    default = probe.get(zmq.MAX_SOCKETS)
+    probe.term()
+
+    with patch("transfer_queue.client.TQ_CLIENT_ZMQ_MAX_SOCKETS", None):
+        client = AsyncTransferQueueClient(
+            client_id="client_max_sockets_unset",
+            controller_info=echo_controller.zmq_server_info,
+        )
+
+    assert client.zmq_context.get(zmq.MAX_SOCKETS) == default
+    client.close()
+
+
+def test_non_numeric_max_sockets_env_var_names_the_variable(echo_controller):
+    """A typo'd value must say which env var is wrong, not raise a bare int() error."""
+    with patch("transfer_queue.client.TQ_CLIENT_ZMQ_MAX_SOCKETS", "not-a-number"):
+        with pytest.raises(ValueError, match="TQ_CLIENT_ZMQ_MAX_SOCKETS must be an integer"):
+            AsyncTransferQueueClient(
+                client_id="client_max_sockets_garbage",
+                controller_info=echo_controller.zmq_server_info,
+            )
 
 
 def test_close_skips_destroy_while_loop_thread_alive(echo_controller):
