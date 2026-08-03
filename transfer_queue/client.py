@@ -1171,10 +1171,20 @@ class AsyncTransferQueueClient:
     def _can_destroy_zmq_context(self) -> bool:
         """Whether it is safe to call ``destroy()`` on the shared context.
 
-        Always true here: this class owns no background thread, so the caller's
-        quiescence contract (documented on :meth:`close`) is the only requirement.
-        Subclasses that run their own loop thread override this.
+        This class owns no background thread of its own, so the caller's quiescence
+        contract (documented on :meth:`close`) covers the client side. But a storage
+        manager that *borrowed* this context runs a notify thread the client cannot see,
+        and that thread holds sockets on it -- so ask the manager whether it finished
+        shutting down. Subclasses that run their own loop thread extend this.
         """
+        manager = getattr(self, "storage_manager", None)
+        if manager is not None:
+            can_destroy = getattr(manager, "can_destroy_zmq_context", None)
+            # Only consult a manager that actually shares this context; one with its own
+            # context has no say in when the client's is destroyed.
+            if callable(can_destroy) and getattr(manager, "zmq_context", None) is self.zmq_context:
+                if not can_destroy():
+                    return False
         return True
 
     # ==================== Checkpoint API ====================
@@ -1891,6 +1901,12 @@ class TransferQueueClient(AsyncTransferQueueClient):
         super().close()
 
     def _can_destroy_zmq_context(self) -> bool:
-        """False while the loop thread that owns sockets on the context is still alive."""
+        """False while the loop thread that owns sockets on the context is still alive.
+
+        Also defers to the base check, which covers a borrowing storage manager's notify
+        thread -- both threads must be gone before ``destroy()`` is safe.
+        """
         thread = getattr(self, "_thread", None)
-        return thread is None or not thread.is_alive()
+        if thread is not None and thread.is_alive():
+            return False
+        return super()._can_destroy_zmq_context()

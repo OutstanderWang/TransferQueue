@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import asyncio
+import inspect
 import itertools
 import os
 import threading
@@ -403,6 +404,11 @@ class StorageManager(ABC):
             else:
                 logger.debug(f"[{self.storage_manager_id}]: Notify ZMQ thread shut down.")
 
+        # Record the outcome even when the context is borrowed: the owner cannot see this
+        # thread, so a borrower that stayed silent here would let the owner destroy() a
+        # context whose sockets are still in use. See can_destroy_zmq_context().
+        self._notify_thread_stopped = notify_thread_stopped
+
         if self._owns_zmq_context:
             # Ordering below is load-bearing: destroy() calls Socket.close() internally,
             # which is NOT thread-safe, so it must run only after the notify thread that
@@ -420,12 +426,28 @@ class StorageManager(ABC):
                     f"The context will be leaked."
                 )
 
+    def can_destroy_zmq_context(self) -> bool:
+        """Whether an owner may safely ``destroy()`` a context this manager borrowed.
+
+        ``destroy()`` calls ``Socket.close()`` internally and is not thread-safe, so the
+        notify thread must be gone first. Only this manager can see that thread, so an
+        owner of a borrowed context must ask before tearing the context down.
+
+        Checks the thread directly rather than trusting the flag recorded by ``close()``,
+        so this is also correct if called before ``close()`` or if the thread exited late.
+        """
+        thread = getattr(self, "_notify_thread", None)
+        return thread is None or not thread.is_alive()
+
     def __del__(self):
         """Destructor to ensure resources are cleaned up."""
         try:
             self.close()
         except Exception as e:
-            logger.error(f"[{self.storage_manager_id}]: Exception during __del__: {str(e)}")
+            # __init__ may have failed before storage_manager_id was set; reaching for it
+            # here would raise AttributeError and mask the exception we mean to report.
+            manager_id = getattr(self, "storage_manager_id", f"<uninitialized {type(self).__name__}>")
+            logger.error(f"[{manager_id}]: Exception during __del__: {str(e)}")
 
 
 class StorageManagerFactory:
@@ -458,15 +480,48 @@ class StorageManagerFactory:
     ) -> StorageManager:
         """Create and return a StorageManager instance.
 
-        Extra keyword arguments are forwarded verbatim to the registered class. The
-        factory deliberately knows nothing about any individual backend: each manager
-        decides for itself what to do with what it receives (e.g. whether to borrow a
-        caller-supplied ``zmq_context`` or keep its own).
+        Extra keyword arguments are forwarded to the registered class. The factory
+        deliberately knows nothing about any individual backend: each manager decides for
+        itself what to do with what it receives (e.g. whether to borrow a caller-supplied
+        ``zmq_context`` or keep its own).
+
+        Registration is an extension mechanism, so managers written against the older
+        ``(controller_info, config)`` contract must keep working without being updated in
+        lockstep. Any keyword the constructor does not accept is therefore dropped, with a
+        warning, rather than raising ``TypeError``.
         """
         assert manager_type in cls._registry, (
             f"Unknown manager_type: {manager_type}. Supported managers include: {list(cls._registry.keys())}"
         )
-        return cls._registry[manager_type](controller_info, config, **kwargs)
+        manager_cls = cls._registry[manager_type]
+        accepted = cls._filter_supported_kwargs(manager_cls, kwargs, manager_type)
+        return manager_cls(controller_info, config, **accepted)
+
+    @staticmethod
+    def _filter_supported_kwargs(
+        manager_cls: type[StorageManager], kwargs: dict[str, Any], manager_type: str
+    ) -> dict[str, Any]:
+        """Drop keywords ``manager_cls.__init__`` cannot accept, warning about each.
+
+        A constructor taking ``**kwargs`` is assumed to accept everything.
+        """
+        if not kwargs:
+            return kwargs
+        try:
+            params = inspect.signature(manager_cls.__init__).parameters
+        except (TypeError, ValueError):
+            # Un-introspectable constructor (e.g. a C extension): pass through unchanged
+            # rather than silently dropping arguments the class may well accept.
+            return kwargs
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return kwargs
+        supported = {name: value for name, value in kwargs.items() if name in params}
+        for name in kwargs.keys() - supported.keys():
+            logger.warning(
+                f"{manager_cls.__name__} (registered as '{manager_type}') does not accept "
+                f"'{name}'; ignoring it. Add '{name}' to its __init__ signature to use it."
+            )
+        return supported
 
 
 class KVStorageManager(StorageManager):
