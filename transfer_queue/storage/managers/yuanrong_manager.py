@@ -15,6 +15,8 @@
 
 from typing import Any
 
+import zmq
+
 from transfer_queue.storage.managers.base import KVStorageManager, StorageManagerFactory
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import ZMQServerInfo
@@ -26,7 +28,12 @@ logger = get_logger(__name__)
 class YuanrongStorageManager(KVStorageManager):
     """Storage manager for Yuanrong backend."""
 
-    def __init__(self, controller_info: ZMQServerInfo, config: dict[str, Any]):
+    def __init__(
+        self,
+        controller_info: ZMQServerInfo,
+        config: dict[str, Any],
+        zmq_context: zmq.asyncio.Context | None = None,
+    ):
         worker_port = config.get("worker_port", None)
         client_name = config.get("client_name", None)
 
@@ -38,4 +45,4 @@ class YuanrongStorageManager(KVStorageManager):
             config["client_name"] = "YuanrongStorageClient"
         elif client_name != "YuanrongStorageClient":
             raise ValueError(f"Invalid 'client_name': {client_name} in config. Expecting 'YuanrongStorageClient'")
-        super().__init__(controller_info, config)
+        super().__init__(controller_info, config, zmq_context=zmq_context)

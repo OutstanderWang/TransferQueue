@@ -76,11 +76,12 @@ class StorageManager(ABC):
         # Handshake socket is sync (used only during initialization)
         self.controller_handshake_socket: zmq.Socket | None = None
 
-        # SimpleStorage may borrow a client-owned context whose fixed native I/O
-        # thread pool is shared by controller and storage-unit request sockets.
-        # Other backends and standalone managers retain their own context.
+        # A manager may borrow a caller-owned context whose fixed native I/O thread pool
+        # is shared by controller and storage-unit request sockets; SimpleStorage does.
+        # A manager that is handed nothing owns the context it creates, and only an owner
+        # tears its context down (see close()).
         self._owns_zmq_context = zmq_context is None
-        self.zmq_context = zmq_context or zmq.asyncio.Context()
+        self.zmq_context = zmq.asyncio.Context() if zmq_context is None else zmq_context
         self._connect_to_controller()
 
         # Dedicated asyncio loop for ZMQ notify traffic, isolated from the caller's loop
@@ -393,17 +394,31 @@ class StorageManager(ABC):
         if hasattr(self, "_notify_loop") and self._notify_loop.is_running():
             self._notify_loop.call_soon_threadsafe(self._notify_loop.stop)
 
+        notify_thread_stopped = True
         if hasattr(self, "_notify_thread") and self._notify_thread is not None:
             self._notify_thread.join(timeout=5.0)
             if self._notify_thread.is_alive():
+                notify_thread_stopped = False
                 logger.warning(f"[{self.storage_manager_id}]: Notify ZMQ thread did not stop within 5 second timeout.")
             else:
                 logger.debug(f"[{self.storage_manager_id}]: Notify ZMQ thread shut down.")
 
         if self._owns_zmq_context:
-            # destroy(linger=0) force-closes any socket still open (e.g. from an interrupted
-            # request or the notify path) then terminates, so shutdown cannot hang on term().
-            self.zmq_context.destroy(linger=0)
+            # Ordering below is load-bearing: destroy() calls Socket.close() internally,
+            # which is NOT thread-safe, so it must run only after the notify thread that
+            # owns sockets on this context is gone. If that thread outlived its join
+            # timeout, leak the context rather than risk a crash during shutdown -- the
+            # process is terminating anyway, so a leaked context is the cheaper outcome.
+            if notify_thread_stopped:
+                # destroy(linger=0) force-closes any socket still open (e.g. from an interrupted
+                # request or the notify path) then terminates, so shutdown cannot hang on term().
+                self.zmq_context.destroy(linger=0)
+            else:
+                logger.warning(
+                    f"[{self.storage_manager_id}]: Skipping zmq_context.destroy() because the notify "
+                    f"thread is still alive; destroy() is not thread-safe while sockets are in use. "
+                    f"The context will be leaked."
+                )
 
     def __del__(self):
         """Destructor to ensure resources are cleaned up."""
@@ -439,16 +454,19 @@ class StorageManagerFactory:
         manager_type: str,
         controller_info: ZMQServerInfo,
         config: dict[str, Any],
-        zmq_context: zmq.asyncio.Context | None = None,
+        **kwargs: Any,
     ) -> StorageManager:
-        """Create and return a StorageManager instance."""
+        """Create and return a StorageManager instance.
+
+        Extra keyword arguments are forwarded verbatim to the registered class. The
+        factory deliberately knows nothing about any individual backend: each manager
+        decides for itself what to do with what it receives (e.g. whether to borrow a
+        caller-supplied ``zmq_context`` or keep its own).
+        """
         assert manager_type in cls._registry, (
             f"Unknown manager_type: {manager_type}. Supported managers include: {list(cls._registry.keys())}"
         )
-        manager_cls = cls._registry[manager_type]
-        if manager_type == "SimpleStorage" and zmq_context is not None:
-            return manager_cls(controller_info, config, zmq_context=zmq_context)
-        return manager_cls(controller_info, config)
+        return cls._registry[manager_type](controller_info, config, **kwargs)
 
 
 class KVStorageManager(StorageManager):
@@ -457,9 +475,22 @@ class KVStorageManager(StorageManager):
     It maps structured metadata (BatchMeta) to flat lists of keys and values for efficient KV operations.
     """
 
-    def __init__(self, controller_info: ZMQServerInfo, config: dict[str, Any]):
+    def __init__(
+        self,
+        controller_info: ZMQServerInfo,
+        config: dict[str, Any],
+        zmq_context: zmq.asyncio.Context | None = None,
+    ):
         """
         Initialize the KVStorageManager with configuration.
+
+        Args:
+            controller_info: Controller ZMQ server information.
+            config: Backend configuration; must contain ``client_name``.
+            zmq_context: Accepted for interface uniformity but deliberately ignored.
+                KV backends move bulk data through their own SDKs and use ZMQ only for
+                the controller notify/handshake path, so they keep an independent
+                context rather than drawing on a caller's shared socket budget.
         """
         client_name = config.get("client_name", None)
         if client_name is None:
