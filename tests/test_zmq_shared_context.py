@@ -454,3 +454,134 @@ def test_close_skips_destroy_while_loop_thread_alive(echo_controller):
     # With the thread genuinely gone, the veto lifts.
     assert client._can_destroy_zmq_context() is True
     context.destroy(linger=0)
+
+
+def _make_borrowing_manager(zmq_context):
+    """A minimal manager that borrows a caller's context, like SimpleStorage does."""
+
+    class Borrower(StorageManager):
+        def _connect_to_controller(self):
+            pass
+
+        def _do_handshake_with_controller(self):
+            pass
+
+        async def put_data(self, *args, **kwargs):
+            return None
+
+        async def get_data(self, *args, **kwargs):
+            return None
+
+        async def clear_data(self, *args, **kwargs):
+            return None
+
+        async def notify_data_update(self, *args, **kwargs):
+            return None
+
+    return Borrower(None, {}, zmq_context=zmq_context)
+
+
+def test_stuck_notify_thread_vetoes_destroy_of_borrowed_context(echo_controller):
+    """A borrowing manager's stuck notify thread must veto the owner's destroy().
+
+    The manager detects the failed shutdown but, because it does not own the context, has
+    no destroy() of its own to skip. If it stays silent the client proceeds to destroy a
+    context whose sockets that thread may still hold -- the documented non-thread-safe
+    Socket.close() hazard. The client must ask the manager first.
+    """
+    client = AsyncTransferQueueClient(
+        client_id="client_notify_thread_veto",
+        controller_info=echo_controller.zmq_server_info,
+    )
+    client.storage_manager = _make_borrowing_manager(client.zmq_context)
+    context = client.zmq_context
+
+    with patch.object(client.storage_manager._notify_thread, "is_alive", return_value=True):
+        assert client._can_destroy_zmq_context() is False
+        client.close()
+        assert not context.closed, "context must be leaked while the notify thread lives"
+
+    # Veto lifts once the thread is genuinely gone.
+    assert client._can_destroy_zmq_context() is True
+    context.destroy(linger=0)
+
+
+def test_healthy_notify_thread_does_not_block_destroy(echo_controller):
+    """The veto must not over-trigger: a clean manager shutdown still destroys."""
+    client = AsyncTransferQueueClient(
+        client_id="client_notify_thread_clean",
+        controller_info=echo_controller.zmq_server_info,
+    )
+    client.storage_manager = _make_borrowing_manager(client.zmq_context)
+
+    client.close()
+    assert client.zmq_context.closed
+
+
+def test_manager_with_own_context_does_not_veto(echo_controller):
+    """A manager holding its own context has no say in the client's teardown."""
+    client = AsyncTransferQueueClient(
+        client_id="client_independent_manager",
+        controller_info=echo_controller.zmq_server_info,
+    )
+    client.storage_manager = _make_borrowing_manager(None)  # creates its own context
+    assert client.storage_manager.zmq_context is not client.zmq_context
+
+    # Even a stuck notify thread on an unrelated context must not block the client.
+    with patch.object(client.storage_manager._notify_thread, "is_alive", return_value=True):
+        assert client._can_destroy_zmq_context() is True
+
+    client.storage_manager.zmq_context.destroy(linger=0)
+    client.close()
+    assert client.zmq_context.closed
+
+
+def test_factory_tolerates_legacy_manager_signature(echo_controller):
+    """A manager on the old (controller_info, config) contract must still construct.
+
+    Registration is an extension mechanism, so third-party managers are not required to
+    add ``zmq_context`` in lockstep. The factory drops keywords a constructor cannot
+    accept instead of raising TypeError.
+    """
+
+    @StorageManagerFactory.register("LEGACY_SIGNATURE_PROBE")
+    class LegacyManager(StorageManager):
+        def __init__(self, controller_info, config):  # no zmq_context parameter
+            super().__init__(controller_info, config)
+
+        def _connect_to_controller(self):
+            pass
+
+        def _do_handshake_with_controller(self):
+            pass
+
+        async def put_data(self, *args, **kwargs):
+            return None
+
+        async def get_data(self, *args, **kwargs):
+            return None
+
+        async def clear_data(self, *args, **kwargs):
+            return None
+
+        async def notify_data_update(self, *args, **kwargs):
+            return None
+
+    try:
+        client = AsyncTransferQueueClient(
+            client_id="client_legacy_manager",
+            controller_info=echo_controller.zmq_server_info,
+        )
+
+        # Must not raise TypeError: unexpected keyword argument 'zmq_context'.
+        client.initialize_storage_manager("LEGACY_SIGNATURE_PROBE", {})
+
+        assert isinstance(client.storage_manager, LegacyManager)
+        # It never saw the context, so it owns the one it made and must not be vetoed on.
+        assert client.storage_manager.zmq_context is not client.zmq_context
+        assert client.storage_manager._owns_zmq_context
+
+        client.storage_manager.close()
+        client.close()
+    finally:
+        StorageManagerFactory._registry.pop("LEGACY_SIGNATURE_PROBE", None)
