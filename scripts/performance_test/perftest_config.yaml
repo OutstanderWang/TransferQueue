@@ -25,8 +25,9 @@ backend:
   SimpleStorage:
     # Maximum number of experience samples to hold across all storage units
     total_storage_size: 100000
-    # Number of distributed storage units.
-    # Recommended: >= 2 x number of nodes for load balancing.
+    # Number of distributed storage units. Units are round-robin scheduled across all
+    # alive Ray nodes, guaranteeing an even split of memory/bandwidth usage per node.
+    # Recommended: >= 2 x number of nodes so each node hosts multiple units.
     num_data_storage_units: 16
     # ZMQ Server IP & Ports (automatically generated during init)
     zmq_info: null

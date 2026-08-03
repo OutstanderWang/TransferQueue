@@ -20,7 +20,7 @@ from omegaconf import DictConfig
 
 from transfer_queue.storage.bootstrap.provider import StorageBootstrapProvider
 from transfer_queue.storage.simple_storage import SimpleStorageUnit
-from transfer_queue.utils.common import get_placement_group
+from transfer_queue.utils.common import get_node_round_robin_scheduling_strategies
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import process_zmq_server_info
 
@@ -34,7 +34,7 @@ def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
     simple_storage_handles = {}
     num_data_storage_units = conf.backend.SimpleStorage.num_data_storage_units
     total_storage_size = conf.backend.SimpleStorage.get("total_storage_size", None)
-    storage_placement_group = get_placement_group(num_data_storage_units, num_cpus_per_actor=1)
+    scheduling_strategies = get_node_round_robin_scheduling_strategies(num_data_storage_units)
 
     # Compute per-unit capacity: None means unlimited
     storage_unit_size = (
@@ -43,14 +43,16 @@ def initialize_simple_storage(conf: DictConfig) -> dict[str, Any]:
 
     for storage_unit_rank in range(num_data_storage_units):
         storage_node = SimpleStorageUnit.options(  # type: ignore[attr-defined]
-            placement_group=storage_placement_group,
-            placement_group_bundle_index=storage_unit_rank,
+            scheduling_strategy=scheduling_strategies[storage_unit_rank],
             name=f"TransferQueueStorageUnit#{storage_unit_rank}",
         ).remote(
             storage_unit_size=storage_unit_size,
         )
         simple_storage_handles[f"TransferQueueStorageUnit#{storage_unit_rank}"] = storage_node
-        logger.info(f"TransferQueueStorageUnit#{storage_unit_rank} has been created.")
+        logger.info(
+            f"TransferQueueStorageUnit#{storage_unit_rank} has been created "
+            f"on node {scheduling_strategies[storage_unit_rank].node_id}."
+        )
 
     storage_zmq_info = process_zmq_server_info(simple_storage_handles)
     backend_name = conf.backend.storage_backend
