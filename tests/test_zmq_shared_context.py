@@ -273,9 +273,6 @@ def _make_borrowing_manager(zmq_context):
         def _connect_to_controller(self):
             pass
 
-        def _do_handshake_with_controller(self):
-            pass
-
         async def put_data(self, *args, **kwargs):
             return None
 
@@ -283,9 +280,6 @@ def _make_borrowing_manager(zmq_context):
             return None
 
         async def clear_data(self, *args, **kwargs):
-            return None
-
-        async def notify_data_update(self, *args, **kwargs):
             return None
 
     return Borrower(None, {}, zmq_context=zmq_context)

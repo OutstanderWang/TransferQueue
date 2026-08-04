@@ -145,7 +145,7 @@ class AsyncTransferQueueClient:
         the client, deferring this to interpreter exit -- close() remains the supported path.
         """
         try:
-            if context is not None and not context.closed:
+            if not context.closed:
                 context.destroy(linger=0)
         except Exception as e:
             logger.warning(f"[{client_id}]: Error destroying zmq_context in finalizer: {e}")
@@ -1372,8 +1372,8 @@ class TransferQueueClient(AsyncTransferQueueClient):
             zmq_io_threads: Fixed size of the client context's native I/O-thread pool.
                 Defaults to ``TQ_CLIENT_ZMQ_IO_THREADS`` (8).
             zmq_max_sockets: Maximum number of sockets the client context may hold open
-                at once. Defaults to ``TQ_CLIENT_ZMQ_MAX_SOCKETS``, and to libzmq's own
-                default (1023) when that is unset.
+                at once. Defaults to ``TQ_CLIENT_ZMQ_MAX_SOCKETS``, and to
+                ``DEFAULT_CLIENT_ZMQ_MAX_SOCKETS`` (8192) when that is unset.
         """
         super().__init__(
             client_id,
