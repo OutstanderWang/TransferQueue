@@ -362,18 +362,12 @@ def with_zmq_socket(
 ):
     """Create a reusable async decorator for request sockets.
 
-    This decorator encapsulates the common socket lifecycle used by both
-    client-side and storage-manager-side request paths:
-    get owner's shared context -> create/connect socket -> inject socket -> close socket.
+    Lifecycle: get owner's shared context -> create/connect socket -> inject -> close socket.
 
-    The ZMQ context is owned by ``self`` (via ``get_context``) and is long-lived: it is
-    created once per owner and reused across all calls, then terminated once when the owner
-    is closed. Only the DEALER *socket* is created and closed per call. Do NOT create or
-    terminate a context here -- per-call context churn corrupts libzmq's signaler file
-    descriptors under concurrency (Bad file descriptor / SIGABRT) and can hang on term().
-    Contexts are thread-safe and event-loop-agnostic, so a single shared context is safe
-    even when decorated methods run on different loops/threads; each socket is created and
-    fully used within one awaited call on one loop.
+    The context comes from ``self`` via ``get_context`` and is long-lived; only the DEALER
+    socket is per-call. Do NOT create or terminate a context here -- per-call churn corrupts
+    libzmq's signaler file descriptors under concurrency (Bad file descriptor / SIGABRT) and
+    can hang on term(). Contexts are thread-safe and loop-agnostic, so sharing one is safe.
 
     Args:
         socket_name: Socket port key in ``ZMQServerInfo.ports``.
@@ -427,9 +421,8 @@ def with_zmq_socket(
                 kwargs["socket"] = sock
                 return await func(self, *args, **kwargs)
             finally:
-                # Close the per-call socket only; the context outlives the call.
-                # linger=0 drops any unsent frames immediately (the reply is already
-                # received on the happy path) so close never blocks the event loop.
+                # Close the per-call socket only; the context outlives the call. linger=0
+                # drops unsent frames so close never blocks the event loop.
                 if sock is not None and not sock.closed:
                     sock.close(linger=0)
 

@@ -38,16 +38,12 @@ from transfer_queue.utils.zmq_utils import (
 logger = get_logger(__name__)
 
 TQ_NUM_THREADS = int(os.environ.get("TQ_NUM_THREADS", 8))
-# Size of the client context's native I/O-thread pool. The context serves every
-# controller RPC (all backends) and, for SimpleStorage, storage-unit requests too,
-# so this knob is client-scoped rather than backend-scoped.
+# Size of the client context's native I/O-thread pool, shared by all controller RPCs and,
+# for SimpleStorage, storage-unit requests -- so this knob is client- not backend-scoped.
 TQ_CLIENT_ZMQ_IO_THREADS = int(os.environ.get("TQ_CLIENT_ZMQ_IO_THREADS", 8))
-# Per-context socket ceiling. Because the context is shared per client instead of created
-# per call, all in-flight sockets draw on a single budget: a borrowing storage manager adds
-# one socket per storage unit per in-flight put/get, so libzmq's own default (1023) is
-# reachable in large-scale training. Default well above it and clamp to the build's
-# ZMQ_SOCKET_LIMIT. Sockets are still created lazily -- this raises the ceiling, it does
-# not preallocate -- but the process also needs file descriptors for them (``ulimit -n``).
+# Per-context socket ceiling, shared by every in-flight socket on the client's context
+# (including a borrowing storage manager's), so libzmq's own 1023 is reachable at scale.
+# Raising it also needs enough file descriptors (``ulimit -n``).
 TQ_CLIENT_ZMQ_MAX_SOCKETS = os.environ.get("TQ_CLIENT_ZMQ_MAX_SOCKETS") or None
 DEFAULT_CLIENT_ZMQ_MAX_SOCKETS = 8192
 
@@ -95,9 +91,8 @@ class AsyncTransferQueueClient:
             raise TypeError(f"controller_info must be ZMQServerInfo, got {type(controller_info)}")
         self.client_id = client_id
         self._controller: ZMQServerInfo = controller_info
-        # One long-lived context per client. Its fixed native I/O-thread pool is shared
-        # by all controller RPCs and, for SimpleStorage only, storage-unit requests.
-        # Sockets remain per-request because ZMQ sockets are not thread-safe.
+        # One long-lived context per client; sockets stay per-request because ZMQ sockets
+        # are not thread-safe.
         io_threads = TQ_CLIENT_ZMQ_IO_THREADS if zmq_io_threads is None else zmq_io_threads
         if io_threads < 1:
             raise ValueError(f"Client ZMQ I/O thread pool size must be at least 1, got {io_threads}")
@@ -135,11 +130,9 @@ class AsyncTransferQueueClient:
             max_sockets = socket_limit
         self.zmq_context.set(zmq.MAX_SOCKETS, max_sockets)
 
-        # Users forget to call close(); without this the context and its I/O threads leak
-        # for the process lifetime. finalize() (not __del__) so it also runs at interpreter
-        # exit, and it is idempotent with an explicit close(). Note that for
-        # TransferQueueClient the running loop thread references the client, so collection
-        # is deferred until interpreter exit -- close() is still the supported path.
+        # Backstop for a client that is never closed, so the context and its I/O threads do
+        # not leak for the process lifetime. finalize() (not __del__) also runs at
+        # interpreter exit; close() detaches it. See _release_zmq_context().
         self._finalizer = weakref.finalize(self, self._release_zmq_context, self.zmq_context, client_id)
         logger.info(f"[{self.client_id}]: Registered Controller server {controller_info.id} at {controller_info.ip}")
 
@@ -147,9 +140,9 @@ class AsyncTransferQueueClient:
     def _release_zmq_context(context: "zmq.asyncio.Context", client_id: str) -> None:
         """Destroy *context* if it is still open.
 
-        Must stay a staticmethod taking the context explicitly: a bound method would keep
-        the client alive and the finalizer would never fire. Only reached for a client that
-        was never closed, so the owning threads are gone (interpreter exit) or unreachable.
+        Must stay a staticmethod taking the context explicitly, or the bound method would
+        keep the client alive and never fire. TransferQueueClient's loop thread references
+        the client, deferring this to interpreter exit -- close() remains the supported path.
         """
         try:
             if context is not None and not context.closed:
@@ -1181,12 +1174,9 @@ class AsyncTransferQueueClient:
     def close(self) -> None:
         """Close the client and cleanup resources including storage manager.
 
-        The caller must ensure no RPCs are still in flight: this tears down the shared
-        ZMQ context via ``destroy()``, which calls ``Socket.close()`` internally and is
-        **not** thread-safe. Driving this client from your own event loop means closing
-        it only after outstanding tasks have been awaited or cancelled. Subclasses that
-        own a loop thread must join it before delegating here (see
-        :meth:`TransferQueueClient.close`).
+        The caller must ensure no RPCs are in flight: this destroys the shared context, and
+        ``destroy()`` calls ``Socket.close()`` internally, which is **not** thread-safe.
+        Subclasses owning a loop thread must join it first (see TransferQueueClient.close).
         """
         try:
             if hasattr(self, "storage_manager") and self.storage_manager:
@@ -1195,11 +1185,9 @@ class AsyncTransferQueueClient:
         except Exception as e:
             logger.warning(f"Error closing storage manager: {e}")
 
-        # Tear down the shared context last. destroy(linger=0) force-closes any socket that
-        # leaked from an interrupted RPC then terminates, so shutdown cannot hang.
+        # Tear down the shared context last; linger=0 so shutdown cannot hang.
         if not self._can_destroy_zmq_context():
-            # Detach before returning: the finalizer would otherwise fire later and run the
-            # very destroy() this branch judged unsafe, defeating the deliberate leak.
+            # Detach first, or the finalizer would later run the destroy() judged unsafe here.
             self._detach_finalizer()
             logger.warning(
                 f"[{self.client_id}]: Skipping zmq_context.destroy() because a thread owning "
@@ -1224,11 +1212,9 @@ class AsyncTransferQueueClient:
     def _can_destroy_zmq_context(self) -> bool:
         """Whether it is safe to call ``destroy()`` on the shared context.
 
-        This class owns no background thread of its own, so the caller's quiescence
-        contract (documented on :meth:`close`) covers the client side. But a storage
-        manager that *borrowed* this context runs a notify thread the client cannot see,
-        and that thread holds sockets on it -- so ask the manager whether it finished
-        shutting down. Subclasses that run their own loop thread extend this.
+        A storage manager that *borrowed* this context runs a notify thread the client
+        cannot see, and that thread holds sockets on it, so ask the manager first.
+        Subclasses running their own loop thread extend this.
         """
         manager = getattr(self, "storage_manager", None)
         if manager is not None:
@@ -1929,13 +1915,9 @@ class TransferQueueClient(AsyncTransferQueueClient):
     def close(self) -> None:
         """Close the client and cleanup resources including event loop and thread.
 
-        The ordering here is load-bearing and must not be rearranged: the background
-        loop thread is stopped and joined *before* delegating to
-        :meth:`AsyncTransferQueueClient.close`, which destroys the shared ZMQ context.
-        ``destroy()`` calls ``Socket.close()`` internally and is not thread-safe, so no
-        other thread may hold sockets on that context when it runs. If the join times
-        out, :meth:`_can_destroy_zmq_context` reports False and the context is leaked
-        instead of destroyed unsafely.
+        Ordering is load-bearing: the loop thread is joined *before* the base close()
+        destroys the context, since ``destroy()`` is not thread-safe. If the join times
+        out, ``_can_destroy_zmq_context()`` returns False and the context is leaked instead.
         """
 
         if hasattr(self, "_loop") and self._loop is not None:

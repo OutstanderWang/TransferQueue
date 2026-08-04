@@ -15,14 +15,10 @@
 
 """Regression tests for the shared long-lived ZMQ context in with_zmq_socket.
 
-Background: with_zmq_socket used to create a brand-new ``zmq.asyncio.Context()`` per RPC
-call and ``context.term()`` it in the finally block. Under concurrency this churned
-libzmq signaler file descriptors and crashed the process (``signaler.cpp`` Bad file
-descriptor -> SIGABRT). The fix makes the decorator reuse the owner's long-lived context
-(``get_context``) and only create/close the DEALER socket per call.
-
-These tests assert that concurrent decorated calls all reuse the SAME context object and
-that the context is never terminated between calls, only when the client is closed.
+with_zmq_socket used to create and term() a context per RPC call, which churned libzmq
+signaler file descriptors and crashed the process under concurrency (Bad file descriptor
+-> SIGABRT). It now reuses the owner's context and only creates the socket per call, so
+these tests assert every concurrent call sees the SAME context, alive until close().
 """
 
 import asyncio
@@ -298,10 +294,8 @@ def _make_borrowing_manager(zmq_context):
 def test_stuck_notify_thread_vetoes_destroy_of_borrowed_context(echo_controller):
     """A borrowing manager's stuck notify thread must veto the owner's destroy().
 
-    The manager detects the failed shutdown but, because it does not own the context, has
-    no destroy() of its own to skip. If it stays silent the client proceeds to destroy a
-    context whose sockets that thread may still hold -- the documented non-thread-safe
-    Socket.close() hazard. The client must ask the manager first.
+    The manager has no destroy() of its own to skip, so staying silent would let the client
+    destroy a context whose sockets that thread may still hold. It must be asked first.
     """
     client = AsyncTransferQueueClient(
         client_id="client_notify_thread_veto",

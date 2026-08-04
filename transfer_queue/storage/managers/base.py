@@ -77,10 +77,8 @@ class StorageManager(ABC):
         # Handshake socket is sync (used only during initialization)
         self.controller_handshake_socket: zmq.Socket | None = None
 
-        # A manager may borrow a caller-owned context whose fixed native I/O thread pool
-        # is shared by controller and storage-unit request sockets; SimpleStorage does.
-        # A manager that is handed nothing owns the context it creates, and only an owner
-        # tears its context down (see close()).
+        # A manager may borrow a caller-owned context (SimpleStorage does) or own the one it
+        # creates when handed nothing. Only an owner tears its context down (see close()).
         self._owns_zmq_context = zmq_context is None
         self.zmq_context = zmq.asyncio.Context() if zmq_context is None else zmq_context
         self._connect_to_controller()
@@ -405,14 +403,12 @@ class StorageManager(ABC):
                 logger.debug(f"[{self.storage_manager_id}]: Notify ZMQ thread shut down.")
 
         if self._owns_zmq_context:
-            # Ordering below is load-bearing: destroy() calls Socket.close() internally,
-            # which is NOT thread-safe, so it must run only after the notify thread that
-            # owns sockets on this context is gone. If that thread outlived its join
-            # timeout, leak the context rather than risk a crash during shutdown -- the
-            # process is terminating anyway, so a leaked context is the cheaper outcome.
+            # destroy() calls Socket.close(), which is not thread-safe, so it must run only
+            # after the notify thread holding sockets is gone. If that thread outlived its
+            # join, leak the context rather than risk a crash on a terminating process.
             if notify_thread_stopped:
-                # destroy(linger=0) force-closes any socket still open (e.g. from an interrupted
-                # request or the notify path) then terminates, so shutdown cannot hang on term().
+                # linger=0 force-closes sockets left by an interrupted request, so this
+                # cannot hang on term().
                 self.zmq_context.destroy(linger=0)
             else:
                 logger.warning(
@@ -424,12 +420,9 @@ class StorageManager(ABC):
     def can_destroy_zmq_context(self) -> bool:
         """Whether an owner may safely ``destroy()`` a context this manager borrowed.
 
-        ``destroy()`` calls ``Socket.close()`` internally and is not thread-safe, so the
-        notify thread must be gone first. Only this manager can see that thread, so an
-        owner of a borrowed context must ask before tearing the context down.
-
-        Checks the thread directly rather than trusting the flag recorded by ``close()``,
-        so this is also correct if called before ``close()`` or if the thread exited late.
+        ``destroy()`` is not thread-safe, so the notify thread must be gone first, and only
+        this manager can see it. Checks the thread directly so it stays correct when called
+        before ``close()`` or if the thread exited late.
         """
         thread = getattr(self, "_notify_thread", None)
         return thread is None or not thread.is_alive()
@@ -475,15 +468,10 @@ class StorageManagerFactory:
     ) -> StorageManager:
         """Create and return a StorageManager instance.
 
-        Extra keyword arguments are forwarded to the registered class. The factory
-        deliberately knows nothing about any individual backend: each manager decides for
-        itself what to do with what it receives (e.g. whether to borrow a caller-supplied
-        ``zmq_context`` or keep its own).
-
-        Registration is an extension mechanism, so managers written against the older
-        ``(controller_info, config)`` contract must keep working without being updated in
-        lockstep. Any keyword the constructor does not accept is therefore dropped, with a
-        warning, rather than raising ``TypeError``.
+        Extra keywords are forwarded verbatim; the factory knows no backend by name, so each
+        manager decides what to do with what it receives. Keywords a constructor cannot
+        accept are dropped with a warning, keeping older ``(controller_info, config)``
+        managers working without a lockstep update.
         """
         assert manager_type in cls._registry, (
             f"Unknown manager_type: {manager_type}. Supported managers include: {list(cls._registry.keys())}"
