@@ -404,11 +404,6 @@ class StorageManager(ABC):
             else:
                 logger.debug(f"[{self.storage_manager_id}]: Notify ZMQ thread shut down.")
 
-        # Record the outcome even when the context is borrowed: the owner cannot see this
-        # thread, so a borrower that stayed silent here would let the owner destroy() a
-        # context whose sockets are still in use. See can_destroy_zmq_context().
-        self._notify_thread_stopped = notify_thread_stopped
-
         if self._owns_zmq_context:
             # Ordering below is load-bearing: destroy() calls Socket.close() internally,
             # which is NOT thread-safe, so it must run only after the notify thread that
