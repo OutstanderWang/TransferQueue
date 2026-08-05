@@ -16,6 +16,7 @@
 import asyncio
 import os
 import threading
+import weakref
 from typing import Any, Callable
 
 import torch
@@ -37,12 +38,21 @@ from transfer_queue.utils.zmq_utils import (
 logger = get_logger(__name__)
 
 TQ_NUM_THREADS = int(os.environ.get("TQ_NUM_THREADS", 8))
+# Size of the client context's native I/O-thread pool, shared by all controller RPCs and,
+# for SimpleStorage, storage-unit requests -- so this knob is client- not backend-scoped.
+TQ_CLIENT_ZMQ_IO_THREADS = int(os.environ.get("TQ_CLIENT_ZMQ_IO_THREADS", 8))
+# Per-context socket ceiling, shared by every in-flight socket on the client's context
+# (including a borrowing storage manager's), so libzmq's own 1023 is reachable at scale.
+# Raising it also needs enough file descriptors (``ulimit -n``).
+TQ_CLIENT_ZMQ_MAX_SOCKETS = os.environ.get("TQ_CLIENT_ZMQ_MAX_SOCKETS") or None
+DEFAULT_CLIENT_ZMQ_MAX_SOCKETS = 8192
 
 # Pre-bound decorator for controller socket operations.
 with_controller_socket = with_zmq_socket(
     "request_handle_socket",
     get_identity=lambda self: self.client_id,
     get_peer=lambda self, target: self._controller,
+    get_context=lambda self: self.zmq_context,
 )
 
 
@@ -57,12 +67,23 @@ class AsyncTransferQueueClient:
         self,
         client_id: str,
         controller_info: ZMQServerInfo,
+        zmq_io_threads: int | None = None,
+        zmq_max_sockets: int | None = None,
     ):
         """Initialize the asynchronous TransferQueue client.
 
         Args:
             client_id: Unique identifier for this client instance
             controller_info: Single controller ZMQ server information
+            zmq_io_threads: Fixed size of the client context's native I/O-thread pool.
+                Defaults to ``TQ_CLIENT_ZMQ_IO_THREADS`` (8).
+            zmq_max_sockets: Maximum number of sockets the client context may hold open
+                at once. Defaults to ``TQ_CLIENT_ZMQ_MAX_SOCKETS``, and to
+                ``DEFAULT_CLIENT_ZMQ_MAX_SOCKETS`` (8192) when that is unset -- well above
+                libzmq's own 1023, which large-scale training can exhaust. This ceiling is
+                per-client: a single ``put``/``get`` fans out one socket per storage unit,
+                and a borrowing storage manager shares the same budget. Raising it also
+                requires enough file descriptors (``ulimit -n``).
         """
         if controller_info is None:
             raise ValueError("controller_info cannot be None")
@@ -70,7 +91,64 @@ class AsyncTransferQueueClient:
             raise TypeError(f"controller_info must be ZMQServerInfo, got {type(controller_info)}")
         self.client_id = client_id
         self._controller: ZMQServerInfo = controller_info
+        # One long-lived context per client; sockets stay per-request because ZMQ sockets
+        # are not thread-safe.
+        io_threads = TQ_CLIENT_ZMQ_IO_THREADS if zmq_io_threads is None else zmq_io_threads
+        if io_threads < 1:
+            raise ValueError(f"Client ZMQ I/O thread pool size must be at least 1, got {io_threads}")
+        self.zmq_context = zmq.asyncio.Context(io_threads=io_threads)
+
+        max_sockets = zmq_max_sockets
+        explicitly_requested = max_sockets is not None
+        if max_sockets is None and TQ_CLIENT_ZMQ_MAX_SOCKETS is not None:
+            try:
+                max_sockets = int(TQ_CLIENT_ZMQ_MAX_SOCKETS)
+            except ValueError as e:
+                # Name the variable: a bare int() error gives no clue which knob is wrong.
+                raise ValueError(
+                    f"TQ_CLIENT_ZMQ_MAX_SOCKETS must be an integer, got {TQ_CLIENT_ZMQ_MAX_SOCKETS!r}"
+                ) from e
+            explicitly_requested = True
+        if max_sockets is None:
+            max_sockets = DEFAULT_CLIENT_ZMQ_MAX_SOCKETS
+
+        socket_limit = self.zmq_context.get(zmq.SOCKET_LIMIT)
+        if explicitly_requested:
+            # A value the caller asked for must not be silently reinterpreted.
+            if not 1 <= max_sockets <= socket_limit:
+                raise ValueError(
+                    f"Client ZMQ max sockets must be between 1 and this build's "
+                    f"ZMQ_SOCKET_LIMIT ({socket_limit}), got {max_sockets}"
+                )
+        elif max_sockets > socket_limit:
+            # Nobody asked for the default, so clamp instead of failing to construct on a
+            # build whose ZMQ_SOCKET_LIMIT is below it.
+            logger.debug(
+                f"[{client_id}]: Clamping default ZMQ max sockets {max_sockets} to this "
+                f"build's ZMQ_SOCKET_LIMIT ({socket_limit})."
+            )
+            max_sockets = socket_limit
+        self.zmq_context.set(zmq.MAX_SOCKETS, max_sockets)
+
+        # Backstop for a client that is never closed, so the context and its I/O threads do
+        # not leak for the process lifetime. finalize() (not __del__) also runs at
+        # interpreter exit; close() detaches it. See _release_zmq_context().
+        self._finalizer = weakref.finalize(self, self._release_zmq_context, self.zmq_context, client_id)
         logger.info(f"[{self.client_id}]: Registered Controller server {controller_info.id} at {controller_info.ip}")
+
+    @staticmethod
+    def _release_zmq_context(context: "zmq.asyncio.Context", client_id: str) -> None:
+        """Destroy *context* if it is still open.
+
+        Must stay a staticmethod taking the context explicitly, or the bound method would
+        keep the client alive and never fire. TransferQueueClient's loop thread references
+        the client, deferring this to interpreter exit -- close() remains the supported path.
+        """
+        try:
+            if not context.closed:
+                context.destroy(linger=0)
+        except Exception as e:
+            logger.warning(f"[{client_id}]: Error destroying zmq_context in finalizer: {e}")
 
     def initialize_storage_manager(
         self,
@@ -78,6 +156,10 @@ class AsyncTransferQueueClient:
         config: dict[str, Any],
     ):
         """Initialize the storage manager.
+
+        The client's long-lived ZMQ context is offered to every backend uniformly; each
+        registered manager decides whether to borrow it or keep its own, so the client
+        needs no knowledge of specific backend names.
 
         Args:
             manager_type: Type of storage manager to create. Supported types include:
@@ -88,7 +170,10 @@ class AsyncTransferQueueClient:
 
         """
         self.storage_manager = StorageManagerFactory.create(
-            manager_type, controller_info=self._controller, config=config
+            manager_type,
+            controller_info=self._controller,
+            config=config,
+            zmq_context=self.zmq_context,
         )
 
     # ==================== Basic API ====================
@@ -1087,13 +1172,59 @@ class AsyncTransferQueueClient:
             raise RuntimeError(f"[{self.client_id}]: Error in kv_list: {str(e)}") from e
 
     def close(self) -> None:
-        """Close the client and cleanup resources including storage manager."""
+        """Close the client and cleanup resources including storage manager.
+
+        The caller must ensure no RPCs are in flight: this destroys the shared context, and
+        ``destroy()`` calls ``Socket.close()`` internally, which is **not** thread-safe.
+        Subclasses owning a loop thread must join it first (see TransferQueueClient.close).
+        """
         try:
             if hasattr(self, "storage_manager") and self.storage_manager:
                 if hasattr(self.storage_manager, "close"):
                     self.storage_manager.close()
         except Exception as e:
             logger.warning(f"Error closing storage manager: {e}")
+
+        # Tear down the shared context last; linger=0 so shutdown cannot hang.
+        if not self._can_destroy_zmq_context():
+            # Detach first, or the finalizer would later run the destroy() judged unsafe here.
+            self._detach_finalizer()
+            logger.warning(
+                f"[{self.client_id}]: Skipping zmq_context.destroy() because a thread owning "
+                f"sockets on it is still alive; destroy() is not thread-safe. Leaking the context."
+            )
+            return
+        try:
+            if hasattr(self, "zmq_context") and self.zmq_context is not None:
+                self.zmq_context.destroy(linger=0)
+        except Exception as e:
+            logger.warning(f"[{self.client_id}]: Error terminating zmq_context: {e}")
+        finally:
+            # This close() superseded the finalizer; disarm it so it cannot run twice.
+            self._detach_finalizer()
+
+    def _detach_finalizer(self) -> None:
+        """Disarm the context finalizer, if one was armed."""
+        finalizer = getattr(self, "_finalizer", None)
+        if finalizer is not None:
+            finalizer.detach()
+
+    def _can_destroy_zmq_context(self) -> bool:
+        """Whether it is safe to call ``destroy()`` on the shared context.
+
+        A storage manager that *borrowed* this context runs a notify thread the client
+        cannot see, and that thread holds sockets on it, so ask the manager first.
+        Subclasses running their own loop thread extend this.
+        """
+        manager = getattr(self, "storage_manager", None)
+        if manager is not None:
+            can_destroy = getattr(manager, "can_destroy_zmq_context", None)
+            # Only consult a manager that actually shares this context; one with its own
+            # context has no say in when the client's is destroyed.
+            if callable(can_destroy) and getattr(manager, "zmq_context", None) is self.zmq_context:
+                if not can_destroy():
+                    return False
+        return True
 
     # ==================== Checkpoint API ====================
     @with_controller_socket
@@ -1230,16 +1361,25 @@ class TransferQueueClient(AsyncTransferQueueClient):
         self,
         client_id: str,
         controller_info: ZMQServerInfo,
+        zmq_io_threads: int | None = None,
+        zmq_max_sockets: int | None = None,
     ):
         """Initialize the synchronous TransferQueue client.
 
         Args:
             client_id: Unique identifier for this client instance
             controller_info: Single controller ZMQ server information
+            zmq_io_threads: Fixed size of the client context's native I/O-thread pool.
+                Defaults to ``TQ_CLIENT_ZMQ_IO_THREADS`` (8).
+            zmq_max_sockets: Maximum number of sockets the client context may hold open
+                at once. Defaults to ``TQ_CLIENT_ZMQ_MAX_SOCKETS``, and to
+                ``DEFAULT_CLIENT_ZMQ_MAX_SOCKETS`` (8192) when that is unset.
         """
         super().__init__(
             client_id,
             controller_info,
+            zmq_io_threads,
+            zmq_max_sockets,
         )
 
         # create new event loop in a separate thread
@@ -1773,7 +1913,12 @@ class TransferQueueClient(AsyncTransferQueueClient):
         return self._load_storage_checkpoint(checkpoint_dir)
 
     def close(self) -> None:
-        """Close the client and cleanup resources including event loop and thread."""
+        """Close the client and cleanup resources including event loop and thread.
+
+        Ordering is load-bearing: the loop thread is joined *before* the base close()
+        destroys the context, since ``destroy()`` is not thread-safe. If the join times
+        out, ``_can_destroy_zmq_context()`` returns False and the context is leaked instead.
+        """
 
         if hasattr(self, "_loop") and self._loop is not None:
             self._loop.call_soon_threadsafe(self._loop.stop)
@@ -1789,3 +1934,14 @@ class TransferQueueClient(AsyncTransferQueueClient):
                 logger.warning(f"[{self.client_id}]: Error closing event loop: {e}")
 
         super().close()
+
+    def _can_destroy_zmq_context(self) -> bool:
+        """False while the loop thread that owns sockets on the context is still alive.
+
+        Also defers to the base check, which covers a borrowing storage manager's notify
+        thread -- both threads must be gone before ``destroy()`` is safe.
+        """
+        thread = getattr(self, "_thread", None)
+        if thread is not None and thread.is_alive():
+            return False
+        return super()._can_destroy_zmq_context()

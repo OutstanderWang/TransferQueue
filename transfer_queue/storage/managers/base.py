@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import asyncio
+import inspect
 import itertools
 import os
 import threading
@@ -63,7 +64,12 @@ class StorageManager(ABC):
     """Base class for storage layer. It defines the interface for data operations and
     generally provides handshake & notification capabilities."""
 
-    def __init__(self, controller_info: ZMQServerInfo, config: DictConfig):
+    def __init__(
+        self,
+        controller_info: ZMQServerInfo,
+        config: DictConfig,
+        zmq_context: zmq.asyncio.Context | None = None,
+    ):
         self.storage_manager_id = f"TQ_STORAGE_{uuid4().hex[:8]}"
         self.config = config
         self.controller_info = controller_info
@@ -71,7 +77,10 @@ class StorageManager(ABC):
         # Handshake socket is sync (used only during initialization)
         self.controller_handshake_socket: zmq.Socket | None = None
 
-        self.zmq_context = zmq.asyncio.Context()
+        # A manager may borrow a caller-owned context (SimpleStorage does) or own the one it
+        # creates when handed nothing. Only an owner tears its context down (see close()).
+        self._owns_zmq_context = zmq_context is None
+        self.zmq_context = zmq.asyncio.Context() if zmq_context is None else zmq_context
         self._connect_to_controller()
 
         # Dedicated asyncio loop for ZMQ notify traffic, isolated from the caller's loop
@@ -384,21 +393,49 @@ class StorageManager(ABC):
         if hasattr(self, "_notify_loop") and self._notify_loop.is_running():
             self._notify_loop.call_soon_threadsafe(self._notify_loop.stop)
 
+        notify_thread_stopped = True
         if hasattr(self, "_notify_thread") and self._notify_thread is not None:
             self._notify_thread.join(timeout=5.0)
             if self._notify_thread.is_alive():
+                notify_thread_stopped = False
                 logger.warning(f"[{self.storage_manager_id}]: Notify ZMQ thread did not stop within 5 second timeout.")
             else:
                 logger.debug(f"[{self.storage_manager_id}]: Notify ZMQ thread shut down.")
 
-        self.zmq_context.term()
+        if self._owns_zmq_context:
+            # destroy() calls Socket.close(), which is not thread-safe, so it must run only
+            # after the notify thread holding sockets is gone. If that thread outlived its
+            # join, leak the context rather than risk a crash on a terminating process.
+            if notify_thread_stopped:
+                # linger=0 force-closes sockets left by an interrupted request, so this
+                # cannot hang on term().
+                self.zmq_context.destroy(linger=0)
+            else:
+                logger.warning(
+                    f"[{self.storage_manager_id}]: Skipping zmq_context.destroy() because the notify "
+                    f"thread is still alive; destroy() is not thread-safe while sockets are in use. "
+                    f"The context will be leaked."
+                )
+
+    def can_destroy_zmq_context(self) -> bool:
+        """Whether an owner may safely ``destroy()`` a context this manager borrowed.
+
+        ``destroy()`` is not thread-safe, so the notify thread must be gone first, and only
+        this manager can see it. Checks the thread directly so it stays correct when called
+        before ``close()`` or if the thread exited late.
+        """
+        thread = getattr(self, "_notify_thread", None)
+        return thread is None or not thread.is_alive()
 
     def __del__(self):
         """Destructor to ensure resources are cleaned up."""
         try:
             self.close()
         except Exception as e:
-            logger.error(f"[{self.storage_manager_id}]: Exception during __del__: {str(e)}")
+            # __init__ may have failed before storage_manager_id was set; reaching for it
+            # here would raise AttributeError and mask the exception we mean to report.
+            manager_id = getattr(self, "storage_manager_id", f"<uninitialized {type(self).__name__}>")
+            logger.error(f"[{manager_id}]: Exception during __del__: {str(e)}")
 
 
 class StorageManagerFactory:
@@ -422,12 +459,52 @@ class StorageManagerFactory:
         return decorator
 
     @classmethod
-    def create(cls, manager_type: str, controller_info: ZMQServerInfo, config: dict[str, Any]) -> StorageManager:
-        """Create and return a StorageManager instance."""
+    def create(
+        cls,
+        manager_type: str,
+        controller_info: ZMQServerInfo,
+        config: dict[str, Any],
+        **kwargs: Any,
+    ) -> StorageManager:
+        """Create and return a StorageManager instance.
+
+        Extra keywords are forwarded verbatim; the factory knows no backend by name, so each
+        manager decides what to do with what it receives. Keywords a constructor cannot
+        accept are dropped with a warning, keeping older ``(controller_info, config)``
+        managers working without a lockstep update.
+        """
         assert manager_type in cls._registry, (
             f"Unknown manager_type: {manager_type}. Supported managers include: {list(cls._registry.keys())}"
         )
-        return cls._registry[manager_type](controller_info, config)
+        manager_cls = cls._registry[manager_type]
+        accepted = cls._filter_supported_kwargs(manager_cls, kwargs, manager_type)
+        return manager_cls(controller_info, config, **accepted)
+
+    @staticmethod
+    def _filter_supported_kwargs(
+        manager_cls: type[StorageManager], kwargs: dict[str, Any], manager_type: str
+    ) -> dict[str, Any]:
+        """Drop keywords ``manager_cls.__init__`` cannot accept, warning about each.
+
+        A constructor taking ``**kwargs`` is assumed to accept everything.
+        """
+        if not kwargs:
+            return kwargs
+        try:
+            params = inspect.signature(manager_cls.__init__).parameters
+        except (TypeError, ValueError):
+            # Un-introspectable constructor (e.g. a C extension): pass through unchanged
+            # rather than silently dropping arguments the class may well accept.
+            return kwargs
+        if any(p.kind is inspect.Parameter.VAR_KEYWORD for p in params.values()):
+            return kwargs
+        supported = {name: value for name, value in kwargs.items() if name in params}
+        for name in kwargs.keys() - supported.keys():
+            logger.warning(
+                f"{manager_cls.__name__} (registered as '{manager_type}') does not accept "
+                f"'{name}'; ignoring it. Add '{name}' to its __init__ signature to use it."
+            )
+        return supported
 
 
 class KVStorageManager(StorageManager):
@@ -436,9 +513,22 @@ class KVStorageManager(StorageManager):
     It maps structured metadata (BatchMeta) to flat lists of keys and values for efficient KV operations.
     """
 
-    def __init__(self, controller_info: ZMQServerInfo, config: dict[str, Any]):
+    def __init__(
+        self,
+        controller_info: ZMQServerInfo,
+        config: dict[str, Any],
+        zmq_context: zmq.asyncio.Context | None = None,
+    ):
         """
         Initialize the KVStorageManager with configuration.
+
+        Args:
+            controller_info: Controller ZMQ server information.
+            config: Backend configuration; must contain ``client_name``.
+            zmq_context: Accepted for interface uniformity but deliberately ignored.
+                KV backends move bulk data through their own SDKs and use ZMQ only for
+                the controller notify/handshake path, so they keep an independent
+                context rather than drawing on a caller's shared socket budget.
         """
         client_name = config.get("client_name", None)
         if client_name is None:

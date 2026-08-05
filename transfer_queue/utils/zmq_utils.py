@@ -356,14 +356,18 @@ def with_zmq_socket(
     *,
     get_identity: Callable[[Any], str],
     get_peer: Callable[[Any, str | None], ZMQServerInfo],
+    get_context: Callable[[Any], "zmq.asyncio.Context"],
     resolve_target: Callable[[tuple, dict], str | None] | None = None,
     timeout: int | None = None,
 ):
     """Create a reusable async decorator for request sockets.
 
-    This decorator encapsulates the common socket lifecycle used by both
-    client-side and storage-manager-side request paths:
-    create context/socket -> connect -> inject socket -> close/term.
+    Lifecycle: get owner's shared context -> create/connect socket -> inject -> close socket.
+
+    The context comes from ``self`` via ``get_context`` and is long-lived; only the DEALER
+    socket is per-call. Do NOT create or terminate a context here -- per-call churn corrupts
+    libzmq's signaler file descriptors under concurrency (Bad file descriptor / SIGABRT) and
+    can hang on term(). Contexts are thread-safe and loop-agnostic, so sharing one is safe.
 
     Args:
         socket_name: Socket port key in ``ZMQServerInfo.ports``.
@@ -373,6 +377,8 @@ def with_zmq_socket(
             For single-target scenarios, ignore the target parameter.
             Example: ``lambda self, target: self.server_info``
             Example: ``lambda self, target: self.storage_unit_infos[target]``
+        get_context: Callable that returns the owner's long-lived ``zmq.asyncio.Context``.
+            Example: ``lambda self: self.zmq_context``
         resolve_target: Optional callable that extracts target identifier from
             function arguments. Receives (args, kwargs) and returns target name.
             Example: ``lambda args, kwargs: kwargs.get("target_storage_unit")``
@@ -398,7 +404,11 @@ def with_zmq_socket(
             if port is None:
                 raise RuntimeError(f"Socket '{socket_name}' not configured for server '{server_info.id}'")
 
-            context = zmq.asyncio.Context()
+            # Reuse the owner's long-lived context; only the socket is per-call.
+            context = get_context(self)
+            if context is None:
+                raise RuntimeError("get_context returned None")
+
             sock = None
             try:
                 address = format_zmq_address(server_info.ip, port)
@@ -411,14 +421,10 @@ def with_zmq_socket(
                 kwargs["socket"] = sock
                 return await func(self, *args, **kwargs)
             finally:
-                if sock is not None:
-                    try:
-                        if not sock.closed:
-                            sock.close(linger=-1)
-                    finally:
-                        context.term()
-                else:
-                    context.term()
+                # Close the per-call socket only; the context outlives the call. linger=0
+                # drops unsent frames so close never blocks the event loop.
+                if sock is not None and not sock.closed:
+                    sock.close(linger=0)
 
         return wrapper
 

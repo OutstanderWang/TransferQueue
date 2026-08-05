@@ -49,6 +49,9 @@ with_storage_unit_socket = with_zmq_socket(
     "put_get_socket",
     get_identity=lambda self: self.storage_manager_id,
     get_peer=lambda self, target: self.storage_unit_infos[target],
+    # Long-lived context from the base StorageManager, shared with the notify path. Safe
+    # because the context is loop-agnostic and each socket stays per-call.
+    get_context=lambda self: self.zmq_context,
     resolve_target=lambda args, kwargs: kwargs.get("target_storage_unit"),
     timeout=TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT,
 )
@@ -69,8 +72,13 @@ class AsyncSimpleStorageManager(StorageManager):
     instances using ZMQ communication and dynamic socket management.
     """
 
-    def __init__(self, controller_info: ZMQServerInfo, config: DictConfig):
-        super().__init__(controller_info, config)
+    def __init__(
+        self,
+        controller_info: ZMQServerInfo,
+        config: DictConfig,
+        zmq_context: zmq.asyncio.Context | None = None,
+    ):
+        super().__init__(controller_info, config, zmq_context=zmq_context)
 
         self.config = config
         server_infos: ZMQServerInfo | dict[str, ZMQServerInfo] | None = config.get("zmq_info", None)
