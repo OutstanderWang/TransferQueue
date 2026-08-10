@@ -23,6 +23,7 @@ Pool-specific behavior is covered in test_zmq_socket_pool.py.
 """
 
 import asyncio
+from contextlib import contextmanager
 from threading import Thread
 from unittest.mock import patch
 
@@ -169,36 +170,81 @@ def test_client_rejects_invalid_context_pool_size(echo_controller):
         )
 
 
+@contextmanager
+def _no_context_left_open():
+    """Assert every ZMQ context built inside the block is closed by the time it exits.
+
+    __init__ arms the finalizer only on success, so an invalid argument must either be
+    rejected before the context is built or destroy it on the way out -- otherwise the
+    context and its native I/O threads leak for the process lifetime.
+    """
+    created = []
+    real_context = zmq.asyncio.Context
+
+    def _spy(*args, **kwargs):
+        ctx = real_context(*args, **kwargs)
+        created.append(ctx)
+        return ctx
+
+    with patch("zmq.asyncio.Context", side_effect=_spy):
+        try:
+            yield created
+        finally:
+            leaked = [ctx for ctx in created if not ctx.closed]
+            for ctx in leaked:
+                ctx.destroy(linger=0)
+            assert not leaked, f"{len(leaked)} ZMQ context(s) left open on the failure path"
+
+
 def test_client_rejects_invalid_socket_pool_size(echo_controller):
     """A bad TQ_CLIENT_ZMQ_POOL_SIZE must name the variable, not silently disable reuse.
 
     Below 1 nothing is ever parked, so every request pays a fresh connect while the client
-    still looks pooled. Validation must also run before the context is built: the finalizer
-    is not armed until __init__ finishes, so a raise afterwards would leak the context and
-    its native I/O threads.
+    still looks pooled.
     """
     for bad in (-1, 0):
-        created = []
-        real_context = zmq.asyncio.Context
-
-        def _spy(*args, _real=real_context, _seen=created, **kwargs):
-            ctx = _real(*args, **kwargs)
-            _seen.append(ctx)
-            return ctx
-
         with patch("transfer_queue.client.TQ_CLIENT_ZMQ_POOL_SIZE", bad):
-            with patch("zmq.asyncio.Context", side_effect=_spy):
+            with _no_context_left_open() as created:
                 with pytest.raises(ValueError, match="TQ_CLIENT_ZMQ_POOL_SIZE must be at least 1"):
                     AsyncTransferQueueClient(
                         client_id="client_invalid_socket_pool",
                         controller_info=echo_controller.zmq_server_info,
                     )
-        try:
-            assert created == [], "the context must not be allocated before validation"
-        finally:
-            for ctx in created:
-                if not ctx.closed:
-                    ctx.destroy(linger=0)
+                assert created == [], "checkable without a context, so none should be built"
+
+
+def test_invalid_max_sockets_does_not_leak_a_context(echo_controller):
+    """No invalid max-sockets input may leave the context or its I/O threads behind."""
+    # Rejectable without a live context.
+    with patch("transfer_queue.client.TQ_CLIENT_ZMQ_MAX_SOCKETS", "not-a-number"):
+        with _no_context_left_open() as created:
+            with pytest.raises(ValueError, match="TQ_CLIENT_ZMQ_MAX_SOCKETS must be an integer"):
+                AsyncTransferQueueClient(
+                    client_id="client_garbage_max_sockets",
+                    controller_info=echo_controller.zmq_server_info,
+                )
+            assert created == [], "parsing needs no context, so none should be built"
+
+    for bad in (0, -5):
+        with _no_context_left_open() as created:
+            with pytest.raises(ValueError, match="at least 1"):
+                AsyncTransferQueueClient(
+                    client_id="client_low_max_sockets",
+                    controller_info=echo_controller.zmq_server_info,
+                    zmq_max_sockets=bad,
+                )
+            assert created == [], "the lower bound needs no context, so none should be built"
+
+    # Above ZMQ_SOCKET_LIMIT: this one genuinely needs a live context, so it must be
+    # destroyed rather than hoisted.
+    with _no_context_left_open() as created:
+        with pytest.raises(ValueError, match="ZMQ_SOCKET_LIMIT"):
+            AsyncTransferQueueClient(
+                client_id="client_huge_max_sockets",
+                controller_info=echo_controller.zmq_server_info,
+                zmq_max_sockets=10**9,
+            )
+        assert len(created) == 1, "the limit check requires a built context"
 
 
 def test_simple_storage_borrows_client_context(echo_controller):

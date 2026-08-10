@@ -97,8 +97,9 @@ class AsyncTransferQueueClient:
         # One long-lived context per client, with sockets leased from a pool over it rather
         # than built per request; a lease is exclusive because ZMQ sockets are not
         # thread-safe and replies are matched to requests by arrival order.
-        # Validate every knob before allocating: a raise after the context exists would leak
-        # it and its native I/O threads, since the finalizer is not armed until the end.
+        # Everything checkable without the context is checked first: the finalizer is not
+        # armed until __init__ returns, so a raise after allocation leaks the context and its
+        # native I/O threads.
         io_threads = TQ_CLIENT_ZMQ_IO_THREADS if zmq_io_threads is None else zmq_io_threads
         if io_threads < 1:
             raise ValueError(f"Client ZMQ I/O thread pool size must be at least 1, got {io_threads}")
@@ -108,7 +109,6 @@ class AsyncTransferQueueClient:
                 f"TQ_CLIENT_ZMQ_POOL_SIZE must be at least 1, got {TQ_CLIENT_ZMQ_POOL_SIZE}. "
                 f"The pool always reuses at least one socket per endpoint; it cannot be disabled."
             )
-        self.zmq_context = zmq.asyncio.Context(io_threads=io_threads)
 
         max_sockets = zmq_max_sockets
         explicitly_requested = max_sockets is not None
@@ -121,26 +121,37 @@ class AsyncTransferQueueClient:
                     f"TQ_CLIENT_ZMQ_MAX_SOCKETS must be an integer, got {TQ_CLIENT_ZMQ_MAX_SOCKETS!r}"
                 ) from e
             explicitly_requested = True
+        if explicitly_requested and max_sockets < 1:
+            # The upper bound needs ZMQ_SOCKET_LIMIT, hence a live context, but the lower one
+            # does not -- so reject it before allocating anything.
+            raise ValueError(f"Client ZMQ max sockets must be at least 1, got {max_sockets}")
         if max_sockets is None:
             max_sockets = DEFAULT_CLIENT_ZMQ_MAX_SOCKETS
 
-        socket_limit = self.zmq_context.get(zmq.SOCKET_LIMIT)
-        if explicitly_requested:
-            # A value the caller asked for must not be silently reinterpreted.
-            if not 1 <= max_sockets <= socket_limit:
-                raise ValueError(
-                    f"Client ZMQ max sockets must be between 1 and this build's "
-                    f"ZMQ_SOCKET_LIMIT ({socket_limit}), got {max_sockets}"
+        self.zmq_context = zmq.asyncio.Context(io_threads=io_threads)
+        try:
+            # ZMQ_SOCKET_LIMIT is a property of the built context, so this last check cannot
+            # be hoisted above it; destroy the context rather than leak it on failure.
+            socket_limit = self.zmq_context.get(zmq.SOCKET_LIMIT)
+            if explicitly_requested:
+                # A value the caller asked for must not be silently reinterpreted.
+                if max_sockets > socket_limit:
+                    raise ValueError(
+                        f"Client ZMQ max sockets must be between 1 and this build's "
+                        f"ZMQ_SOCKET_LIMIT ({socket_limit}), got {max_sockets}"
+                    )
+            elif max_sockets > socket_limit:
+                # Nobody asked for the default, so clamp instead of failing to construct on a
+                # build whose ZMQ_SOCKET_LIMIT is below it.
+                logger.debug(
+                    f"[{client_id}]: Clamping default ZMQ max sockets {max_sockets} to this "
+                    f"build's ZMQ_SOCKET_LIMIT ({socket_limit})."
                 )
-        elif max_sockets > socket_limit:
-            # Nobody asked for the default, so clamp instead of failing to construct on a
-            # build whose ZMQ_SOCKET_LIMIT is below it.
-            logger.debug(
-                f"[{client_id}]: Clamping default ZMQ max sockets {max_sockets} to this "
-                f"build's ZMQ_SOCKET_LIMIT ({socket_limit})."
-            )
-            max_sockets = socket_limit
-        self.zmq_context.set(zmq.MAX_SOCKETS, max_sockets)
+                max_sockets = socket_limit
+            self.zmq_context.set(zmq.MAX_SOCKETS, max_sockets)
+        except BaseException:
+            self.zmq_context.destroy(linger=0)
+            raise
         # Sockets are leased from this pool and reused across requests, so the context's
         # socket budget above is consumed by the concurrency high-water mark, not by
         # request count. Lent to a borrowing storage manager alongside the context.

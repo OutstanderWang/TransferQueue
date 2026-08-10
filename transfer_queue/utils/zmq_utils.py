@@ -488,21 +488,32 @@ class ZMQSocketPool:
     def _take(self, key: "_PoolKey") -> zmq.Socket | None:
         """Pop a live idle socket for *key*, discarding any found closed."""
         with self._lock:
+            # Drop finished owners first, so the endpoint sweep never walks their buckets.
             buckets = self._owner_buckets()
-            # Leasing this address makes it the peer's current one, retiring any earlier
-            # address. Recorded on acquire so a lease already in flight to a superseded
-            # address is recognised as stale when it comes back (see _release).
-            self._endpoints[key.peer_id, key.socket_name] = key.address
-            for stale in [k for k in buckets if self._superseded(k)]:
-                # Nothing will ask for these again, and each keeps libzmq reconnecting to a
-                # dead endpoint in the background.
-                self._close_all({stale: buckets.pop(stale)})
+            self._mark_current(key)
             bucket = buckets.get(key)
             while bucket:
                 sock = bucket.pop()
                 if not sock.closed:
                     return sock
         return None
+
+    def _mark_current(self, key: "_PoolKey") -> None:
+        """Record *key*'s address as its peer's current one and retire every older address.
+
+        Callers must hold ``self._lock``. Recorded on acquire so a lease already in flight to
+        a superseded address is recognised when it returns (see _release). The sweep covers
+        every owner, not just this one: the pool is deliberately shared between a client's RPC
+        loop and a storage manager's notify loop, and an idle socket parked by an owner that
+        goes quiet would otherwise keep reconnecting to the retired address forever. Sockets
+        are only ever closed here, never handed across owners.
+        """
+        if self._endpoints.get((key.peer_id, key.socket_name)) == key.address:
+            return  # unchanged, so nothing to retire
+        self._endpoints[key.peer_id, key.socket_name] = key.address
+        for buckets in self._idle.values():
+            for stale in [k for k in buckets if self._superseded(k)]:
+                self._close_all({stale: buckets.pop(stale)})
 
     def _superseded(self, key: "_PoolKey") -> bool:
         """Whether *key* names an address its peer has since moved away from.

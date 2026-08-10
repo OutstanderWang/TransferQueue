@@ -316,6 +316,55 @@ async def test_moved_peer_does_not_accumulate_stale_buckets():
 
 
 @pytest.mark.asyncio
+async def test_superseded_sockets_are_evicted_from_every_owner():
+    """A migration seen by one owner must retire the old address in all of them.
+
+    The pool is deliberately shared between a client's RPC loop and a storage manager's
+    notify loop, so several owners can hold idle sockets for the same peer. Sweeping only
+    the current owner leaves the others reconnecting to the retired address until they
+    happen to lease again -- or forever, if they go quiet.
+    """
+    old = _Peer(peer_id="su0", tag=b"OLD:")
+    new = _Peer(peer_id="su0", tag=b"NEW:")
+    ctx = zmq.asyncio.Context()
+    pool = ZMQSocketPool(ctx, "owner")
+    loops = []
+
+    def spawn_owner():
+        loop = asyncio.new_event_loop()
+        threading.Thread(target=loop.run_forever, daemon=True).start()
+        loops.append(loop)
+        return loop
+
+    def run_on(loop, info):
+        return asyncio.run_coroutine_threadsafe(_round_trip(pool, info), loop).result(timeout=10)
+
+    try:
+        # Two owners park a socket to the old address and stay alive.
+        parked = [spawn_owner(), spawn_owner()]
+        for loop in parked:
+            assert run_on(loop, old.info) == b"OLD:req"
+        assert len(pool._idle) == 2, "each live loop should hold its own bucket"
+
+        # A third owner observes the migration.
+        assert run_on(spawn_owner(), new.info) == b"NEW:req"
+
+        addresses = {k.address for buckets in pool._idle.values() for k in buckets}
+        assert addresses == {new.info.to_addr("put_get_socket")}, f"stale addresses remain: {addresses}"
+
+        # Every owner still reaches the current endpoint afterwards.
+        for loop in parked:
+            assert run_on(loop, new.info) == b"NEW:req"
+    finally:
+        for loop in loops:
+            loop.call_soon_threadsafe(loop.stop)
+        pool.close()
+        ctx.destroy(linger=0)
+        old.stop()
+        new.stop()
+
+
+@pytest.mark.asyncio
 async def test_lease_in_flight_when_peer_moves_is_not_parked():
     """A lease already out on loan when its peer moves must not re-enter the pool.
 
