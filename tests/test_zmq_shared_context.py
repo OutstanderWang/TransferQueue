@@ -32,7 +32,7 @@ import zmq
 import transfer_queue.utils.zmq_utils as zmq_utils
 from transfer_queue.client import AsyncTransferQueueClient, TransferQueueClient
 from transfer_queue.metadata import BatchMeta
-from transfer_queue.storage.managers.base import StorageManager
+from transfer_queue.storage.managers.base import StorageManager, StorageManagerFactory
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo
@@ -211,12 +211,90 @@ def test_simple_storage_borrows_client_socket_pool(echo_controller):
 
     assert manager.zmq_socket_pool is client.zmq_socket_pool
     assert not manager._owns_zmq_context
+    assert not manager._owns_zmq_socket_pool
 
     # Closing the borrower must leave the lender's pool usable.
     manager.close()
     assert not client.zmq_context.closed
 
     client.close()
+
+
+def test_manager_pools_over_a_context_lent_without_a_pool(echo_controller):
+    """Passing ``zmq_context`` alone stays supported and must not raise.
+
+    Older callers and third-party managers pass only a context, and
+    StorageManagerFactory drops ``zmq_socket_pool`` for constructors that do not accept
+    it -- so the manager pools over the borrowed context and owns only that pool.
+    """
+    client = AsyncTransferQueueClient(
+        client_id="client_context_without_pool",
+        controller_info=echo_controller.zmq_server_info,
+    )
+
+    with patch("transfer_queue.storage.managers.base.StorageManager._connect_to_controller"):
+        manager = AsyncSimpleStorageManager(
+            echo_controller.zmq_server_info,
+            {"zmq_info": {"storage_0": echo_controller.zmq_server_info}},
+            zmq_context=client.zmq_context,
+        )
+
+    assert manager.zmq_context is client.zmq_context
+    assert not manager._owns_zmq_context
+    # Its own pool, built over the borrowed context rather than shared with the lender.
+    assert manager._owns_zmq_socket_pool
+    assert manager.zmq_socket_pool is not client.zmq_socket_pool
+    assert manager.zmq_socket_pool._ctx is client.zmq_context
+
+    # Closing it must release its own pool without touching the lender's context.
+    manager.close()
+    assert not client.zmq_context.closed
+
+    client.close()
+
+
+def test_factory_construction_without_pool_support_still_works(echo_controller):
+    """A registered manager whose __init__ predates ``zmq_socket_pool`` must still build.
+
+    The factory filters the unsupported keyword and forwards the context alone, which used
+    to hit a construction-time error.
+    """
+
+    @StorageManagerFactory.register("_LegacyContextOnly")
+    class LegacyContextOnly(StorageManager):
+        def __init__(self, controller_info, config, zmq_context=None):
+            super().__init__(controller_info, config, zmq_context=zmq_context)
+
+        def _connect_to_controller(self):
+            pass
+
+        async def put_data(self, *args, **kwargs):
+            return None
+
+        async def get_data(self, *args, **kwargs):
+            return None
+
+        async def clear_data(self, *args, **kwargs):
+            return None
+
+    client = AsyncTransferQueueClient(
+        client_id="client_legacy_factory",
+        controller_info=echo_controller.zmq_server_info,
+    )
+    try:
+        manager = StorageManagerFactory.create(
+            "_LegacyContextOnly",
+            controller_info=echo_controller.zmq_server_info,
+            config={},
+            zmq_context=client.zmq_context,
+            zmq_socket_pool=client.zmq_socket_pool,
+        )
+        assert manager.zmq_socket_pool._ctx is client.zmq_context
+        manager.close()
+        assert not client.zmq_context.closed
+    finally:
+        StorageManagerFactory._registry.pop("_LegacyContextOnly", None)
+        client.close()
 
 
 def test_simple_storage_does_not_destroy_borrowed_context(echo_controller):

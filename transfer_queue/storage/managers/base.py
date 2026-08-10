@@ -86,12 +86,14 @@ class StorageManager(ABC):
 
         # A manager may borrow a caller-owned context (SimpleStorage does) or own the one it
         # creates when handed nothing. Only an owner tears its context down (see close()).
-        # The pool must follow the context: one built over a borrowed context would mint
-        # sockets the lender may destroy underneath it, so the two arrive together.
-        if (zmq_context is None) != (zmq_socket_pool is None):
-            raise ValueError("zmq_context and zmq_socket_pool must be passed together, or neither")
         self._owns_zmq_context = zmq_context is None
         self.zmq_context = zmq.asyncio.Context() if zmq_context is None else zmq_context
+        # A caller that lends a context may also lend its pool, so sockets are shared rather
+        # than duplicated. Passing a context alone stays supported -- older callers and
+        # third-party managers do, and the factory drops the pool for constructors that do
+        # not accept it -- in which case this manager pools over the borrowed context and
+        # closes only its own sockets, never the lender's context.
+        self._owns_zmq_socket_pool = zmq_socket_pool is None
         self.zmq_socket_pool = (
             ZMQSocketPool(self.zmq_context, self.storage_manager_id) if zmq_socket_pool is None else zmq_socket_pool
         )
@@ -401,15 +403,19 @@ class StorageManager(ABC):
             else:
                 logger.debug(f"[{self.storage_manager_id}]: Notify ZMQ thread shut down.")
 
+        # Close pooled sockets whenever this manager owns them, even over a borrowed context:
+        # the lender closes its own pool, not this one. Only after the notify thread is gone,
+        # since Socket.close() is not thread-safe and that thread holds leases.
+        if self._owns_zmq_socket_pool and notify_thread_stopped:
+            # linger=0 force-closes sockets left by an interrupted request, so this cannot
+            # hang, and it runs before any destroy() of the context they live on.
+            self.zmq_socket_pool.close()
+
         if self._owns_zmq_context:
             # destroy() calls Socket.close(), which is not thread-safe, so it must run only
             # after the notify thread holding sockets is gone. If that thread outlived its
             # join, leak the context rather than risk a crash on a terminating process.
             if notify_thread_stopped:
-                # Pooled sockets first: they live on the context destroyed next. linger=0
-                # force-closes sockets left by an interrupted request, so this cannot hang
-                # on term().
-                self.zmq_socket_pool.close()
                 self.zmq_context.destroy(linger=0)
             else:
                 logger.warning(
@@ -531,7 +537,8 @@ class KVStorageManager(StorageManager):
                 KV backends move bulk data through their own SDKs and use ZMQ only for
                 the controller notify/handshake path, so they keep an independent
                 context rather than drawing on a caller's shared socket budget.
-            zmq_socket_pool: Ignored for the same reason; the pool must follow the context.
+            zmq_socket_pool: Ignored for the same reason, so this manager pools over its own
+                context rather than the caller's.
         """
         client_name = config.get("client_name", None)
         if client_name is None:
