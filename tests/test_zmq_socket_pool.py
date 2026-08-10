@@ -35,13 +35,17 @@ from transfer_queue.utils.zmq_utils import ZMQServerInfo, ZMQSocketPool
 
 
 class _Peer:
-    """A ROUTER that echoes one reply per request, optionally after a delay."""
+    """A ROUTER that echoes one reply per request, optionally after a delay.
 
-    def __init__(self, delay_first_reply: float = 0.0):
+    ``tag`` distinguishes which endpoint answered, for the re-registration tests.
+    """
+
+    def __init__(self, delay_first_reply: float = 0.0, peer_id: str = "peer_0", tag: bytes = b"reply-to-"):
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.ROUTER)
         port = self.socket.bind_to_random_port("tcp://127.0.0.1")
-        self.info = ZMQServerInfo(role=Role.STORAGE, id="peer_0", ip="127.0.0.1", ports={"put_get_socket": port})
+        self.info = ZMQServerInfo(role=Role.STORAGE, id=peer_id, ip="127.0.0.1", ports={"put_get_socket": port})
+        self._tag = tag
         self._delay_first_reply = delay_first_reply
         self._replies = 0
         self.running = True
@@ -64,7 +68,7 @@ class _Peer:
                     threading.Event().wait(sleep)
                     time_left -= sleep
             self._replies += 1
-            self.socket.send_multipart([identity, b"reply-to-" + request])
+            self.socket.send_multipart([identity, self._tag + request])
 
     def stop(self):
         self.running = False
@@ -259,6 +263,68 @@ def test_pooled_identities_are_unique_across_pools(peer):
     a.close()
     b.close()
     ctx.destroy(linger=0)
+
+
+@pytest.mark.asyncio
+async def test_reregistered_peer_is_not_served_a_stale_socket():
+    """A peer that moves to a new address must not be answered by its old endpoint.
+
+    A storage unit or controller restarted or re-registered keeps its id but gets a fresh
+    port, so keying reuse on the id alone would keep leasing a socket wired to the address
+    it no longer answers on -- silently talking to a dead or reassigned endpoint. All calls
+    share one event loop, as a real client or storage manager does; a loop per call would
+    discard the socket via owner eviction and hide the bug.
+    """
+    old = _Peer(peer_id="su0", tag=b"OLD:")
+    new = _Peer(peer_id="su0", tag=b"NEW:")
+    ctx = zmq.asyncio.Context()
+    pool = ZMQSocketPool(ctx, "owner")
+    try:
+        assert await _round_trip(pool, old.info) == b"OLD:req"
+        # Same id, different port -- exactly what re-registration produces.
+        assert await _round_trip(pool, new.info) == b"NEW:req"
+        # And a peer that moves back is still reachable.
+        assert await _round_trip(pool, old.info) == b"OLD:req"
+    finally:
+        pool.close()
+        ctx.destroy(linger=0)
+        old.stop()
+        new.stop()
+
+
+@pytest.mark.asyncio
+async def test_moved_peer_does_not_accumulate_stale_buckets():
+    """Sockets for an address a peer no longer answers on must be dropped, not kept.
+
+    Keying by endpoint alone would leave one bucket per past address, each holding an open
+    socket that libzmq keeps trying to reconnect.
+    """
+    ctx = zmq.asyncio.Context()
+    pool = ZMQSocketPool(ctx, "owner")
+    moved = [_Peer(peer_id="su_moves", tag=b"E%d:" % i) for i in range(4)]
+    try:
+        for m in moved:
+            await _round_trip(pool, m.info)
+        buckets = [b for owner in pool._idle.values() for b in owner]
+        assert len(buckets) == 1, f"stale endpoint buckets accumulated: {len(buckets)}"
+        assert len(_idle_sockets(pool)) == 1
+    finally:
+        pool.close()
+        ctx.destroy(linger=0)
+        for m in moved:
+            m.stop()
+
+
+def test_pool_size_below_one_is_rejected():
+    """A size under 1 parks nothing, so reuse is silently off while still looking pooled."""
+    ctx = zmq.asyncio.Context()
+    try:
+        for bad in (-1, 0):
+            with pytest.raises(ValueError, match="at least 1"):
+                ZMQSocketPool(ctx, "owner", maxsize=bad)
+        ZMQSocketPool(ctx, "owner", maxsize=1)  # the boundary is valid
+    finally:
+        ctx.destroy(linger=0)
 
 
 def test_connect_failure_does_not_leak_a_socket(peer):

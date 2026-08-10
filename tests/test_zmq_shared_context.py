@@ -169,6 +169,21 @@ def test_client_rejects_invalid_context_pool_size(echo_controller):
         )
 
 
+def test_client_rejects_invalid_socket_pool_size(echo_controller):
+    """A bad TQ_CLIENT_ZMQ_POOL_SIZE must name the variable, not silently disable reuse.
+
+    Below 1 nothing is ever parked, so every request pays a fresh connect while the client
+    still looks pooled.
+    """
+    for bad in (-1, 0):
+        with patch("transfer_queue.client.TQ_CLIENT_ZMQ_POOL_SIZE", bad):
+            with pytest.raises(ValueError, match="TQ_CLIENT_ZMQ_POOL_SIZE must be at least 1"):
+                AsyncTransferQueueClient(
+                    client_id="client_invalid_socket_pool",
+                    controller_info=echo_controller.zmq_server_info,
+                )
+
+
 def test_simple_storage_borrows_client_context(echo_controller):
     client = AsyncTransferQueueClient(
         client_id="client_simple_storage_context",
