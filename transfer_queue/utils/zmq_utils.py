@@ -436,6 +436,10 @@ class ZMQSocketPool:
         # at a new address must not be handed a socket still connected to the old one. The
         # timeout is in the key because one peer is dialed with different timeouts.
         self._idle: dict[Any, dict[_PoolKey, list[zmq.Socket]]] = {}
+        # (peer id, socket name) -> the address most recently leased for it. Bounded by the
+        # peer count, and what lets a lease returning from a superseded address be told apart
+        # from a current one -- _idle alone cannot, since an in-flight socket is not in it.
+        self._endpoints: dict[tuple[str, str], str] = {}
         self._lock = threading.Lock()
         # A ROUTER silently drops a second peer claiming an identity it already has, so
         # identities must not collide between processes: owner_id alone does not suffice
@@ -485,26 +489,40 @@ class ZMQSocketPool:
         """Pop a live idle socket for *key*, discarding any found closed."""
         with self._lock:
             buckets = self._owner_buckets()
+            # Leasing this address makes it the peer's current one, retiring any earlier
+            # address. Recorded on acquire so a lease already in flight to a superseded
+            # address is recognised as stale when it comes back (see _release).
+            self._endpoints[key.peer_id, key.socket_name] = key.address
+            for stale in [k for k in buckets if self._superseded(k)]:
+                # Nothing will ask for these again, and each keeps libzmq reconnecting to a
+                # dead endpoint in the background.
+                self._close_all({stale: buckets.pop(stale)})
             bucket = buckets.get(key)
             while bucket:
                 sock = bucket.pop()
                 if not sock.closed:
                     return sock
-            # Missed, so this peer may have just moved. Drop any socket still connected to an
-            # address it used to answer on: nothing will ask for those again, and each one
-            # keeps libzmq reconnecting to a dead endpoint in the background.
-            stale = [k for k in buckets if k.peer_id == key.peer_id and k.address != key.address]
-            for k in stale:
-                self._close_all({k: buckets.pop(k)})
         return None
 
+    def _superseded(self, key: "_PoolKey") -> bool:
+        """Whether *key* names an address its peer has since moved away from.
+
+        Callers must hold ``self._lock``. Unknown peers are not superseded, so a socket is
+        only ever retired because a newer address was actually seen.
+        """
+        return self._endpoints.get((key.peer_id, key.socket_name), key.address) != key.address
+
     def _release(self, key: "_PoolKey", sock: zmq.Socket) -> None:
-        """Return a cleanly-used socket, closing it if its bucket is already full."""
+        """Return a cleanly-used socket, closing it if superseded or its bucket is full."""
         with self._lock:
-            bucket = self._owner_buckets().setdefault(key, [])
-            if len(bucket) < self._maxsize:
-                bucket.append(sock)
-                return
+            # A lease that was already in flight when the peer moved must not be parked: it is
+            # wired to an address nobody will ask for again, and _take's sweep cannot see a
+            # socket that is out on loan.
+            if not self._superseded(key):
+                bucket = self._owner_buckets().setdefault(key, [])
+                if len(bucket) < self._maxsize:
+                    bucket.append(sock)
+                    return
         sock.close(linger=0)
 
     def _connect(self, peer: ZMQServerInfo, address: str, timeout: int | None) -> zmq.Socket:
@@ -532,6 +550,7 @@ class ZMQSocketPool:
         with self._lock:
             owned = list(self._idle.values())
             self._idle = {}
+            self._endpoints = {}
         for buckets in owned:
             self._close_all(buckets)
 

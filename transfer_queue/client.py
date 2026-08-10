@@ -97,9 +97,17 @@ class AsyncTransferQueueClient:
         # One long-lived context per client, with sockets leased from a pool over it rather
         # than built per request; a lease is exclusive because ZMQ sockets are not
         # thread-safe and replies are matched to requests by arrival order.
+        # Validate every knob before allocating: a raise after the context exists would leak
+        # it and its native I/O threads, since the finalizer is not armed until the end.
         io_threads = TQ_CLIENT_ZMQ_IO_THREADS if zmq_io_threads is None else zmq_io_threads
         if io_threads < 1:
             raise ValueError(f"Client ZMQ I/O thread pool size must be at least 1, got {io_threads}")
+        if TQ_CLIENT_ZMQ_POOL_SIZE < 1:
+            # Name the variable: the pool's own error cannot say which knob supplied the value.
+            raise ValueError(
+                f"TQ_CLIENT_ZMQ_POOL_SIZE must be at least 1, got {TQ_CLIENT_ZMQ_POOL_SIZE}. "
+                f"The pool always reuses at least one socket per endpoint; it cannot be disabled."
+            )
         self.zmq_context = zmq.asyncio.Context(io_threads=io_threads)
 
         max_sockets = zmq_max_sockets
@@ -136,12 +144,6 @@ class AsyncTransferQueueClient:
         # Sockets are leased from this pool and reused across requests, so the context's
         # socket budget above is consumed by the concurrency high-water mark, not by
         # request count. Lent to a borrowing storage manager alongside the context.
-        if TQ_CLIENT_ZMQ_POOL_SIZE < 1:
-            # Name the variable: the pool's own error cannot say which knob supplied the value.
-            raise ValueError(
-                f"TQ_CLIENT_ZMQ_POOL_SIZE must be at least 1, got {TQ_CLIENT_ZMQ_POOL_SIZE}. "
-                f"The pool always reuses at least one socket per endpoint; it cannot be disabled."
-            )
         self.zmq_socket_pool = ZMQSocketPool(self.zmq_context, client_id, maxsize=TQ_CLIENT_ZMQ_POOL_SIZE)
 
         # Backstop for a client that is never closed, so the context and its I/O threads do

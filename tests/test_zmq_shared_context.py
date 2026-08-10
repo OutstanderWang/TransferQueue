@@ -173,15 +173,32 @@ def test_client_rejects_invalid_socket_pool_size(echo_controller):
     """A bad TQ_CLIENT_ZMQ_POOL_SIZE must name the variable, not silently disable reuse.
 
     Below 1 nothing is ever parked, so every request pays a fresh connect while the client
-    still looks pooled.
+    still looks pooled. Validation must also run before the context is built: the finalizer
+    is not armed until __init__ finishes, so a raise afterwards would leak the context and
+    its native I/O threads.
     """
     for bad in (-1, 0):
+        created = []
+        real_context = zmq.asyncio.Context
+
+        def _spy(*args, _real=real_context, _seen=created, **kwargs):
+            ctx = _real(*args, **kwargs)
+            _seen.append(ctx)
+            return ctx
+
         with patch("transfer_queue.client.TQ_CLIENT_ZMQ_POOL_SIZE", bad):
-            with pytest.raises(ValueError, match="TQ_CLIENT_ZMQ_POOL_SIZE must be at least 1"):
-                AsyncTransferQueueClient(
-                    client_id="client_invalid_socket_pool",
-                    controller_info=echo_controller.zmq_server_info,
-                )
+            with patch("zmq.asyncio.Context", side_effect=_spy):
+                with pytest.raises(ValueError, match="TQ_CLIENT_ZMQ_POOL_SIZE must be at least 1"):
+                    AsyncTransferQueueClient(
+                        client_id="client_invalid_socket_pool",
+                        controller_info=echo_controller.zmq_server_info,
+                    )
+        try:
+            assert created == [], "the context must not be allocated before validation"
+        finally:
+            for ctx in created:
+                if not ctx.closed:
+                    ctx.destroy(linger=0)
 
 
 def test_simple_storage_borrows_client_context(echo_controller):

@@ -315,6 +315,38 @@ async def test_moved_peer_does_not_accumulate_stale_buckets():
             m.stop()
 
 
+@pytest.mark.asyncio
+async def test_lease_in_flight_when_peer_moves_is_not_parked():
+    """A lease already out on loan when its peer moves must not re-enter the pool.
+
+    _take's sweep only sees idle sockets, so a request in flight to the old address escapes
+    it and would recreate that bucket on return -- leaving a socket wired to an obsolete
+    endpoint parked indefinitely.
+    """
+    # Answers slowly, so its lease is still out when the new endpoint is first used.
+    old = _Peer(delay_first_reply=1.0, peer_id="su0", tag=b"OLD:")
+    new = _Peer(peer_id="su0", tag=b"NEW:")
+    ctx = zmq.asyncio.Context()
+    pool = ZMQSocketPool(ctx, "owner")
+    try:
+        in_flight = asyncio.create_task(_round_trip(pool, old.info))
+        await asyncio.sleep(0.2)  # let it reach recv before the peer "moves"
+
+        assert await _round_trip(pool, new.info) == b"NEW:req"
+        assert await in_flight == b"OLD:req", "the in-flight request should still complete"
+
+        keys = [k for owner in pool._idle.values() for k in owner]
+        assert len(keys) == 1, f"a superseded endpoint was parked: {[k.address for k in keys]}"
+        assert keys[0].address == new.info.to_addr("put_get_socket")
+        # And the next request still reaches the current endpoint.
+        assert await _round_trip(pool, new.info) == b"NEW:req"
+    finally:
+        pool.close()
+        ctx.destroy(linger=0)
+        old.stop()
+        new.stop()
+
+
 def test_pool_size_below_one_is_rejected():
     """A size under 1 parks nothing, so reuse is silently off while still looking pooled."""
     ctx = zmq.asyncio.Context()
