@@ -48,13 +48,11 @@ _SU_INFO_FILE = "storage_unit_info.json"
 
 # Pre-bound decorator for storage-unit socket operations.
 with_storage_unit_socket = with_zmq_socket(
-    "put_get_socket",
     get_peer=lambda self, target: self.storage_unit_infos[target],
-    # Long-lived pool from the base StorageManager, shared with the notify path. Safe
-    # because leases are keyed by event loop and are exclusive for their duration.
-    get_pool=lambda self: self.zmq_socket_pool,
+    # Storage RPC has its own pool, separate from the notify pool on the same context: the
+    # two dial different peers with different timeouts and could never share a socket.
+    get_pool=lambda self: self.storage_rpc_pool,
     resolve_target=lambda args, kwargs: kwargs.get("target_storage_unit"),
-    timeout=TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT,
 )
 
 
@@ -78,9 +76,15 @@ class AsyncSimpleStorageManager(StorageManager):
         controller_info: ZMQServerInfo,
         config: DictConfig,
         zmq_context: zmq.asyncio.Context | None = None,
-        zmq_socket_pool: ZMQSocketPool | None = None,
     ):
-        super().__init__(controller_info, config, zmq_context=zmq_context, zmq_socket_pool=zmq_socket_pool)
+        super().__init__(controller_info, config, zmq_context=zmq_context)
+        # Storage-unit RPC, on whichever context the base class settled on.
+        self.storage_rpc_pool = ZMQSocketPool(
+            self.zmq_context,
+            self.storage_manager_id,
+            "put_get_socket",
+            timeout=TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT,
+        )
 
         self.config = config
         server_infos: ZMQServerInfo | dict[str, ZMQServerInfo] | None = config.get("zmq_info", None)
@@ -660,4 +664,6 @@ class AsyncSimpleStorageManager(StorageManager):
 
     def close(self) -> None:
         """Close all ZMQ sockets and context to prevent resource leaks."""
+        # Before super(), which may destroy the context these sockets live on.
+        self.storage_rpc_pool.close()
         super().close()

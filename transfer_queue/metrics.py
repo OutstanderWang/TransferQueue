@@ -374,14 +374,22 @@ class TQMetricsExporter:
         """Return the lazily-created socket pool for storage-unit queries."""
         if self._zmq_socket_pool is None:
             self._zmq_ctx = zmq.Context()
-            self._zmq_socket_pool = ZMQSocketPool(self._zmq_ctx, "metrics_collector")
+            self._zmq_socket_pool = ZMQSocketPool(
+                self._zmq_ctx,
+                "metrics_collector",
+                "put_get_socket",
+                timeout=TQ_METRICS_STORAGE_TIMEOUT,
+                # register_storage_units() can remap a storage unit id onto a new address, so
+                # sockets left at the address it moved off must be closed rather than linger.
+                follow_endpoint_changes=True,
+            )
         return self._zmq_socket_pool
 
     def _query_storage_unit(self, su_info: ZMQServerInfo, su_id: str) -> dict[str, Any] | None:
         """Send a synchronous GET_METRICS request to a single storage unit."""
         try:
             pool = self._get_socket_pool()
-            with pool.lease(su_info, "put_get_socket", timeout=TQ_METRICS_STORAGE_TIMEOUT) as sock:
+            with pool.lease(su_info) as sock:
                 request_msg = ZMQMessage.create(
                     request_type=ZMQRequestType.GET_METRICS,
                     sender_id="metrics_collector",

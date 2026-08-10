@@ -33,7 +33,7 @@ import zmq
 import transfer_queue.utils.zmq_utils as zmq_utils
 from transfer_queue.client import AsyncTransferQueueClient, TransferQueueClient
 from transfer_queue.metadata import BatchMeta
-from transfer_queue.storage.managers.base import StorageManager, StorageManagerFactory
+from transfer_queue.storage.managers.base import StorageManager
 from transfer_queue.storage.managers.simple_storage_manager import AsyncSimpleStorageManager
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo
@@ -262,51 +262,20 @@ def test_simple_storage_borrows_client_context(echo_controller):
         controller_info=echo_controller.zmq_server_info,
         config=config,
         zmq_context=client.zmq_context,
-        zmq_socket_pool=client.zmq_socket_pool,
     )
 
     client.close()
 
 
-def test_simple_storage_borrows_client_socket_pool(echo_controller):
-    """A manager borrowing the client's context must borrow its pool too.
+def test_each_scenario_gets_its_own_pool(echo_controller):
+    """Controller RPC, storage RPC and notify must each hold a separate pool.
 
-    A pool over a context it does not own would either outlive its sockets' context or be
-    closed while the lender is still leasing from it.
+    They share one context but never one pool: each dials a different peer or socket name,
+    so a shared pool reused nothing while letting one scenario's sockets be swept by
+    another's. Separate pools keep each scenario's failures to itself.
     """
     client = AsyncTransferQueueClient(
-        client_id="client_borrowed_pool",
-        controller_info=echo_controller.zmq_server_info,
-    )
-
-    with patch("transfer_queue.storage.managers.base.StorageManager._connect_to_controller"):
-        manager = AsyncSimpleStorageManager(
-            echo_controller.zmq_server_info,
-            {"zmq_info": {"storage_0": echo_controller.zmq_server_info}},
-            zmq_context=client.zmq_context,
-            zmq_socket_pool=client.zmq_socket_pool,
-        )
-
-    assert manager.zmq_socket_pool is client.zmq_socket_pool
-    assert not manager._owns_zmq_context
-    assert not manager._owns_zmq_socket_pool
-
-    # Closing the borrower must leave the lender's pool usable.
-    manager.close()
-    assert not client.zmq_context.closed
-
-    client.close()
-
-
-def test_manager_pools_over_a_context_lent_without_a_pool(echo_controller):
-    """Passing ``zmq_context`` alone stays supported and must not raise.
-
-    Older callers and third-party managers pass only a context, and
-    StorageManagerFactory drops ``zmq_socket_pool`` for constructors that do not accept
-    it -- so the manager pools over the borrowed context and owns only that pool.
-    """
-    client = AsyncTransferQueueClient(
-        client_id="client_context_without_pool",
+        client_id="client_scenario_pools",
         controller_info=echo_controller.zmq_server_info,
     )
 
@@ -317,62 +286,18 @@ def test_manager_pools_over_a_context_lent_without_a_pool(echo_controller):
             zmq_context=client.zmq_context,
         )
 
-    assert manager.zmq_context is client.zmq_context
-    assert not manager._owns_zmq_context
-    # Its own pool, built over the borrowed context rather than shared with the lender.
-    assert manager._owns_zmq_socket_pool
-    assert manager.zmq_socket_pool is not client.zmq_socket_pool
-    assert manager.zmq_socket_pool._ctx is client.zmq_context
+    pools = [client.controller_rpc_pool, manager.storage_rpc_pool, manager.notify_pool]
+    assert len({id(pool) for pool in pools}) == 3, "scenarios must not share a pool"
+    # All three live on the one shared context, so the socket budget stays client-wide.
+    assert all(pool._ctx is client.zmq_context for pool in pools)
+    # Each dials the socket its scenario needs.
+    assert client.controller_rpc_pool._socket_name == "request_handle_socket"
+    assert manager.notify_pool._socket_name == "request_handle_socket"
+    assert manager.storage_rpc_pool._socket_name == "put_get_socket"
+    assert manager.storage_rpc_pool._timeout is not None, "storage RPC keeps its send/recv timeout"
 
-    # Closing it must release its own pool without touching the lender's context.
     manager.close()
-    assert not client.zmq_context.closed
-
     client.close()
-
-
-def test_factory_construction_without_pool_support_still_works(echo_controller):
-    """A registered manager whose __init__ predates ``zmq_socket_pool`` must still build.
-
-    The factory filters the unsupported keyword and forwards the context alone, which used
-    to hit a construction-time error.
-    """
-
-    @StorageManagerFactory.register("_LegacyContextOnly")
-    class LegacyContextOnly(StorageManager):
-        def __init__(self, controller_info, config, zmq_context=None):
-            super().__init__(controller_info, config, zmq_context=zmq_context)
-
-        def _connect_to_controller(self):
-            pass
-
-        async def put_data(self, *args, **kwargs):
-            return None
-
-        async def get_data(self, *args, **kwargs):
-            return None
-
-        async def clear_data(self, *args, **kwargs):
-            return None
-
-    client = AsyncTransferQueueClient(
-        client_id="client_legacy_factory",
-        controller_info=echo_controller.zmq_server_info,
-    )
-    try:
-        manager = StorageManagerFactory.create(
-            "_LegacyContextOnly",
-            controller_info=echo_controller.zmq_server_info,
-            config={},
-            zmq_context=client.zmq_context,
-            zmq_socket_pool=client.zmq_socket_pool,
-        )
-        assert manager.zmq_socket_pool._ctx is client.zmq_context
-        manager.close()
-        assert not client.zmq_context.closed
-    finally:
-        StorageManagerFactory._registry.pop("_LegacyContextOnly", None)
-        client.close()
 
 
 def test_simple_storage_does_not_destroy_borrowed_context(echo_controller):
@@ -386,7 +311,6 @@ def test_simple_storage_does_not_destroy_borrowed_context(echo_controller):
             echo_controller.zmq_server_info,
             {"zmq_info": {"storage_0": echo_controller.zmq_server_info}},
             zmq_context=client.zmq_context,
-            zmq_socket_pool=client.zmq_socket_pool,
         )
 
     assert manager.zmq_context is client.zmq_context
@@ -455,9 +379,9 @@ def test_close_skips_destroy_while_loop_thread_alive(echo_controller):
 
 
 def _make_borrowing_manager(client=None):
-    """A minimal manager borrowing *client*'s context and pool, like SimpleStorage does.
+    """A minimal manager borrowing *client*'s context, like SimpleStorage does.
 
-    With no client it creates its own, since the two must always arrive together.
+    With no client it creates its own context. Either way it builds its own notify pool.
     """
 
     class Borrower(StorageManager):
@@ -473,9 +397,7 @@ def _make_borrowing_manager(client=None):
         async def clear_data(self, *args, **kwargs):
             return None
 
-    if client is None:
-        return Borrower(None, {})
-    return Borrower(None, {}, zmq_context=client.zmq_context, zmq_socket_pool=client.zmq_socket_pool)
+    return Borrower(None, {}) if client is None else Borrower(None, {}, zmq_context=client.zmq_context)
 
 
 def test_stuck_notify_thread_vetoes_destroy_of_borrowed_context(echo_controller):

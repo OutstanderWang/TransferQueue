@@ -47,15 +47,14 @@ TQ_CLIENT_ZMQ_IO_THREADS = int(os.environ.get("TQ_CLIENT_ZMQ_IO_THREADS", 8))
 # Raising it also needs enough file descriptors (``ulimit -n``).
 TQ_CLIENT_ZMQ_MAX_SOCKETS = os.environ.get("TQ_CLIENT_ZMQ_MAX_SOCKETS") or None
 DEFAULT_CLIENT_ZMQ_MAX_SOCKETS = 8192
-# Idle sockets kept per (loop, endpoint, timeout) bucket, at least 1. A soft cap: bursts
-# beyond it still get sockets, so this bounds the steady state rather than the peak.
+# Idle sockets kept per (loop, endpoint) bucket, at least 1. A soft cap: bursts beyond it
+# still get sockets, so this bounds the steady state rather than the peak.
 TQ_CLIENT_ZMQ_POOL_SIZE = int(os.environ.get("TQ_CLIENT_ZMQ_POOL_SIZE", 8))
 
 # Pre-bound decorator for controller socket operations.
 with_controller_socket = with_zmq_socket(
-    "request_handle_socket",
     get_peer=lambda self, target: self._controller,
-    get_pool=lambda self: self.zmq_socket_pool,
+    get_pool=lambda self: self.controller_rpc_pool,
 )
 
 
@@ -154,8 +153,14 @@ class AsyncTransferQueueClient:
             raise
         # Sockets are leased from this pool and reused across requests, so the context's
         # socket budget above is consumed by the concurrency high-water mark, not by
-        # request count. Lent to a borrowing storage manager alongside the context.
-        self.zmq_socket_pool = ZMQSocketPool(self.zmq_context, client_id, maxsize=TQ_CLIENT_ZMQ_POOL_SIZE)
+        # request count. Controller RPC only -- the storage backend keeps its own pools, so
+        # neither scenario can disturb the other's sockets.
+        self.controller_rpc_pool = ZMQSocketPool(
+            self.zmq_context,
+            client_id,
+            "request_handle_socket",
+            maxsize=TQ_CLIENT_ZMQ_POOL_SIZE,
+        )
 
         # Backstop for a client that is never closed, so the context and its I/O threads do
         # not leak for the process lifetime. finalize() (not __del__) also runs at
@@ -184,9 +189,10 @@ class AsyncTransferQueueClient:
     ):
         """Initialize the storage manager.
 
-        The client's long-lived ZMQ context and socket pool are offered to every backend
-        uniformly; each registered manager decides whether to borrow them or keep its own,
-        so the client needs no knowledge of specific backend names.
+        The client's long-lived ZMQ context is offered to every backend uniformly; each
+        registered manager decides whether to borrow it or keep its own, so the client
+        needs no knowledge of specific backend names. Managers build their own pools over
+        whichever context they end up with, one per request scenario.
 
         Args:
             manager_type: Type of storage manager to create. Supported types include:
@@ -201,7 +207,6 @@ class AsyncTransferQueueClient:
             controller_info=self._controller,
             config=config,
             zmq_context=self.zmq_context,
-            zmq_socket_pool=self.zmq_socket_pool,
         )
 
     async def _request_controller(
@@ -1082,7 +1087,7 @@ class AsyncTransferQueueClient:
             return
         try:
             # Close pooled sockets before the context that owns them.
-            self.zmq_socket_pool.close()
+            self.controller_rpc_pool.close()
             if hasattr(self, "zmq_context") and self.zmq_context is not None:
                 self.zmq_context.destroy(linger=0)
         except Exception as e:

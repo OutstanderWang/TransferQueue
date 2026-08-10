@@ -22,7 +22,7 @@ from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from functools import wraps
-from typing import Any, Callable, NamedTuple, TypeAlias
+from typing import Any, Callable, TypeAlias
 from uuid import uuid4
 
 import psutil
@@ -386,24 +386,14 @@ def _owner_finished(owner: Any) -> bool:
     return owner.is_closed()
 
 
-class _PoolKey(NamedTuple):
-    """Identifies one interchangeable set of pooled sockets.
-
-    ``address`` rather than ``peer_id`` alone decides reuse: a peer restarted or
-    re-registered under the same id at a new address must not be handed a socket still
-    connected to the old one. ``peer_id`` rides along so a moved peer's now-unreachable
-    sockets can be found and dropped. ``timeout`` is part of the identity because one peer
-    is dialed with different send/recv timeouts.
-    """
-
-    address: str
-    socket_name: str
-    timeout: int | None
-    peer_id: str
-
-
 class ZMQSocketPool:
-    """Lends connected DEALER sockets, reusing them across requests.
+    """Lends connected DEALER sockets for one request scenario, reusing them across calls.
+
+    One pool serves one kind of request -- controller RPC, storage RPC, notify, metrics --
+    so ``socket_name`` and ``timeout`` are fixed here and every socket it holds is
+    interchangeable but for the address it is connected to. Separate pools per scenario also
+    keep them from interfering: a pool shared across scenarios reused nothing anyway, since
+    scenarios differ by owning loop, socket name, or timeout.
 
     A lease is exclusive. Responses do not echo their request's ``request_id`` (see
     ``ZMQMessage.create``), so a reply is matched to its request only by arrival order:
@@ -414,15 +404,31 @@ class ZMQSocketPool:
     accreting a fresh identity every call.
     """
 
-    def __init__(self, ctx: zmq.Context, owner_id: str, maxsize: int = 8):
+    def __init__(
+        self,
+        ctx: zmq.Context,
+        owner_id: str,
+        socket_name: str,
+        *,
+        timeout: int | None = None,
+        maxsize: int = 8,
+        follow_endpoint_changes: bool = False,
+    ):
         """
         Args:
             ctx: Long-lived context to open sockets on, sync or async. The pool borrows it
                 and never terminates it; the owner outlives the pool.
             owner_id: Identity prefix for pooled sockets, for readable peer-side logs.
+            socket_name: Port key in ``ZMQServerInfo.ports`` that every lease dials.
+            timeout: Send/recv timeout in seconds applied to every socket, or None for none.
             maxsize: Idle sockets kept per bucket, at least 1. A soft cap: a burst beyond it
                 still gets sockets, and the excess is closed on return rather than made to
                 wait.
+            follow_endpoint_changes: Set when a peer's address can change under a stable id,
+                as re-registration does. Sockets are keyed by address either way, so a moved
+                peer is always dialed correctly; this additionally closes the sockets left
+                behind at the address it abandoned instead of letting them linger. Only the
+                metrics collector needs it -- elsewhere endpoints are fixed at construction.
         """
         if maxsize < 1:
             # Below 1 nothing is ever parked, so every request pays a fresh connect while
@@ -430,16 +436,18 @@ class ZMQSocketPool:
             raise ValueError(f"ZMQ socket pool size must be at least 1, got {maxsize}")
         self._ctx = ctx
         self._owner_id = owner_id
+        self._socket_name = socket_name
+        self._timeout = timeout
         self._maxsize = maxsize
-        # Keyed by lease owner (see _lease_owner), then by (endpoint, socket name, timeout).
-        # The endpoint, not the peer id: a peer restarted or re-registered under the same id
-        # at a new address must not be handed a socket still connected to the old one. The
-        # timeout is in the key because one peer is dialed with different timeouts.
-        self._idle: dict[Any, dict[_PoolKey, list[zmq.Socket]]] = {}
-        # (peer id, socket name) -> the address most recently leased for it. Bounded by the
-        # peer count, and what lets a lease returning from a superseded address be told apart
-        # from a current one -- _idle alone cannot, since an in-flight socket is not in it.
-        self._endpoints: dict[tuple[str, str], str] = {}
+        self._follow_endpoint_changes = follow_endpoint_changes
+        # Keyed by lease owner (see _lease_owner), then by address. The address, not the peer
+        # id: a peer restarted under the same id at a new address must not be handed a socket
+        # still connected to the old one.
+        self._idle: dict[Any, dict[str, list[zmq.Socket]]] = {}
+        # peer id -> the address most recently leased for it, tracked only when endpoints can
+        # move. What lets a lease returning from an abandoned address be told apart from a
+        # current one; _idle alone cannot, since an in-flight socket is not in it.
+        self._endpoints: dict[str, str] = {}
         self._lock = threading.Lock()
         # A ROUTER silently drops a second peer claiming an identity it already has, so
         # identities must not collide between processes: owner_id alone does not suffice
@@ -448,20 +456,19 @@ class ZMQSocketPool:
         self._counter = itertools.count()
 
     @contextmanager
-    def lease(self, peer: ZMQServerInfo, socket_name: str, timeout: int | None = None) -> Iterator[zmq.Socket]:
+    def lease(self, peer: ZMQServerInfo) -> Iterator[zmq.Socket]:
         """Yield a socket connected to ``peer``, returning it to the pool only on success.
 
         A plain (non-async) contextmanager on purpose: ``with`` still sees exceptions and
         ``CancelledError`` raised across ``await``s in its body, so this one definition
         serves both async and synchronous callers.
         """
-        port = peer.ports.get(socket_name)
+        port = peer.ports.get(self._socket_name)
         if port is None:
-            raise RuntimeError(f"Socket '{socket_name}' not configured for server '{peer.id}'")
+            raise RuntimeError(f"Socket '{self._socket_name}' not configured for server '{peer.id}'")
 
         address = format_zmq_address(peer.ip, port)
-        key = _PoolKey(address=address, socket_name=socket_name, timeout=timeout, peer_id=peer.id)
-        sock = self._take(key) or self._connect(peer, address, timeout)
+        sock = self._take(peer.id, address) or self._connect(peer, address)
         try:
             yield sock
         except BaseException:
@@ -471,9 +478,9 @@ class ZMQSocketPool:
             sock.close(linger=0)
             raise
         else:
-            self._release(key, sock)
+            self._release(peer.id, address, sock)
 
-    def _owner_buckets(self) -> dict[_PoolKey, list[zmq.Socket]]:
+    def _owner_buckets(self) -> dict[str, list[zmq.Socket]]:
         """Buckets for the current lease owner, first evicting any owner that has finished.
 
         Callers must hold ``self._lock``. A closed loop's sockets must not linger: a pooled
@@ -485,65 +492,66 @@ class ZMQSocketPool:
             self._close_all(self._idle.pop(owner))
         return self._idle.setdefault(_lease_owner(), {})
 
-    def _take(self, key: "_PoolKey") -> zmq.Socket | None:
-        """Pop a live idle socket for *key*, discarding any found closed."""
+    def _take(self, peer_id: str, address: str) -> zmq.Socket | None:
+        """Pop a live idle socket for *address*, discarding any found closed."""
         with self._lock:
             # Drop finished owners first, so the endpoint sweep never walks their buckets.
             buckets = self._owner_buckets()
-            self._mark_current(key)
-            bucket = buckets.get(key)
+            self._mark_current(peer_id, address)
+            bucket = buckets.get(address)
             while bucket:
                 sock = bucket.pop()
                 if not sock.closed:
                     return sock
         return None
 
-    def _mark_current(self, key: "_PoolKey") -> None:
-        """Record *key*'s address as its peer's current one and retire every older address.
+    def _mark_current(self, peer_id: str, address: str) -> None:
+        """Record *address* as *peer_id*'s current one and close sockets to the old one.
 
         Callers must hold ``self._lock``. Recorded on acquire so a lease already in flight to
-        a superseded address is recognised when it returns (see _release). The sweep covers
-        every owner, not just this one: the pool is deliberately shared between a client's RPC
-        loop and a storage manager's notify loop, and an idle socket parked by an owner that
-        goes quiet would otherwise keep reconnecting to the retired address forever. Sockets
-        are only ever closed here, never handed across owners.
+        an abandoned address is recognised when it returns (see _release). The sweep spans
+        every owner: an idle socket parked by an owner that then goes quiet would otherwise
+        keep reconnecting to the abandoned address forever. Sockets are only ever closed
+        here, never handed across owners.
         """
-        if self._endpoints.get((key.peer_id, key.socket_name)) == key.address:
+        if not self._follow_endpoint_changes:
+            return
+        if self._endpoints.get(peer_id) == address:
             return  # unchanged, so nothing to retire
-        self._endpoints[key.peer_id, key.socket_name] = key.address
+        self._endpoints[peer_id] = address
         for buckets in self._idle.values():
-            for stale in [k for k in buckets if self._superseded(k)]:
+            for stale in [addr for addr in buckets if self._superseded(peer_id, addr)]:
                 self._close_all({stale: buckets.pop(stale)})
 
-    def _superseded(self, key: "_PoolKey") -> bool:
-        """Whether *key* names an address its peer has since moved away from.
+    def _superseded(self, peer_id: str, address: str) -> bool:
+        """Whether *address* is one its peer has since moved away from.
 
         Callers must hold ``self._lock``. Unknown peers are not superseded, so a socket is
         only ever retired because a newer address was actually seen.
         """
-        return self._endpoints.get((key.peer_id, key.socket_name), key.address) != key.address
+        return self._endpoints.get(peer_id, address) != address
 
-    def _release(self, key: "_PoolKey", sock: zmq.Socket) -> None:
+    def _release(self, peer_id: str, address: str, sock: zmq.Socket) -> None:
         """Return a cleanly-used socket, closing it if superseded or its bucket is full."""
         with self._lock:
             # A lease that was already in flight when the peer moved must not be parked: it is
             # wired to an address nobody will ask for again, and _take's sweep cannot see a
             # socket that is out on loan.
-            if not self._superseded(key):
-                bucket = self._owner_buckets().setdefault(key, [])
+            if not self._superseded(peer_id, address):
+                bucket = self._owner_buckets().setdefault(address, [])
                 if len(bucket) < self._maxsize:
                     bucket.append(sock)
                     return
         sock.close(linger=0)
 
-    def _connect(self, peer: ZMQServerInfo, address: str, timeout: int | None) -> zmq.Socket:
+    def _connect(self, peer: ZMQServerInfo, address: str) -> zmq.Socket:
         """Open and connect a new DEALER socket to *address*."""
         identity = f"{self._identity_prefix}_to_{peer.id}_{next(self._counter)}".encode()
         sock = create_zmq_socket(self._ctx, zmq.DEALER, peer.ip, identity=identity)
         try:
-            if timeout is not None:
-                sock.setsockopt(zmq.RCVTIMEO, timeout * 1000)
-                sock.setsockopt(zmq.SNDTIMEO, timeout * 1000)
+            if self._timeout is not None:
+                sock.setsockopt(zmq.RCVTIMEO, self._timeout * 1000)
+                sock.setsockopt(zmq.SNDTIMEO, self._timeout * 1000)
             sock.connect(address)
         except BaseException:
             # Nothing owns the socket until it is handed to a lease, so close it here or it
@@ -556,7 +564,7 @@ class ZMQSocketPool:
         """Close every idle socket. Safe to call twice, and after the context is gone.
 
         The pool stays usable afterwards: a lease still outstanding returns its socket to a
-        fresh bucket. Both callers destroy the context right after, so nothing is reused.
+        fresh bucket. Callers destroy the context right after, so nothing is reused.
         """
         with self._lock:
             owned = list(self._idle.values())
@@ -565,7 +573,7 @@ class ZMQSocketPool:
         for buckets in owned:
             self._close_all(buckets)
 
-    def _close_all(self, buckets: dict[_PoolKey, list[zmq.Socket]]) -> None:
+    def _close_all(self, buckets: dict[str, list[zmq.Socket]]) -> None:
         """Close every socket in *buckets*, tolerating an already-destroyed context."""
         for sock in itertools.chain.from_iterable(buckets.values()):
             try:
@@ -576,30 +584,28 @@ class ZMQSocketPool:
 
 
 def with_zmq_socket(
-    socket_name: str,
     *,
     get_peer: Callable[[Any, str | None], ZMQServerInfo],
     get_pool: Callable[[Any], ZMQSocketPool],
     resolve_target: Callable[[tuple, dict], str | None] | None = None,
-    timeout: int | None = None,
 ):
     """Create a reusable async decorator that injects a pooled request socket.
 
     Lifecycle: resolve peer -> lease a socket from ``self``'s pool -> inject as the
     ``socket`` kwarg -> return it to the pool if the call succeeded, else discard it.
 
+    The socket name and timeout come from the pool, which serves one request scenario.
+
     Args:
-        socket_name: Socket port key in ``ZMQServerInfo.ports``.
         get_peer: Callable that returns ``ZMQServerInfo`` for the target.
             For single-target scenarios, ignore the target parameter.
             Example: ``lambda self, target: self.server_info``
             Example: ``lambda self, target: self.storage_unit_infos[target]``
-        get_pool: Callable that returns the owner's ``ZMQSocketPool``.
-            Example: ``lambda self: self.zmq_socket_pool``
+        get_pool: Callable that returns the pool for this scenario.
+            Example: ``lambda self: self.controller_rpc_pool``
         resolve_target: Optional callable that extracts target identifier from
             function arguments. Receives (args, kwargs) and returns target name.
             Example: ``lambda args, kwargs: kwargs.get("target_storage_unit")``
-        timeout: Optional timeout (seconds) for both send/recv operations.
     """
 
     def decorator(func: Callable):
@@ -617,7 +623,7 @@ def with_zmq_socket(
             if pool is None:
                 raise RuntimeError("get_pool returned None")
 
-            with pool.lease(server_info, socket_name, timeout) as sock:
+            with pool.lease(server_info) as sock:
                 kwargs["socket"] = sock
                 return await func(self, *args, **kwargs)
 

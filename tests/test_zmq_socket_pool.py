@@ -89,8 +89,8 @@ def _idle_sockets(pool: ZMQSocketPool) -> list:
     return [s for buckets in pool._idle.values() for bucket in buckets.values() for s in bucket]
 
 
-async def _round_trip(pool, peer_info, payload=b"req", timeout=None):
-    with pool.lease(peer_info, "put_get_socket", timeout=timeout) as sock:
+async def _round_trip(pool, peer_info, payload=b"req"):
+    with pool.lease(peer_info) as sock:
         await sock.send_multipart([payload])
         return (await sock.recv_multipart())[0]
 
@@ -99,7 +99,7 @@ async def _round_trip(pool, peer_info, payload=b"req", timeout=None):
 async def test_socket_is_reused_across_requests(peer):
     """Sequential requests to one peer must share a single socket."""
     ctx = zmq.asyncio.Context()
-    pool = ZMQSocketPool(ctx, "owner")
+    pool = ZMQSocketPool(ctx, "owner", "put_get_socket")
 
     for i in range(10):
         assert await _round_trip(pool, peer.info, f"req{i}".encode()) == f"reply-to-req{i}".encode()
@@ -118,19 +118,20 @@ async def test_timed_out_socket_is_not_reused():
     Regression guard for the core hazard: with the socket pooled, the *next* request would
     receive the previous request's reply, silently attributing one response to another.
     """
-    # Reply to the first request only after its 1s timeout has expired, so the reply is
-    # still in flight when the socket would otherwise be handed to the next caller.
-    peer = _Peer(delay_first_reply=2.0)
+    # Replies to the first request only after the pool's 1s timeout has expired, so that
+    # reply is still in flight when the socket would otherwise go to the next caller. The
+    # peer serves serially, so the delay stays well inside the second request's own timeout.
+    peer = _Peer(delay_first_reply=1.4)
     ctx = zmq.asyncio.Context()
-    pool = ZMQSocketPool(ctx, "owner")
+    pool = ZMQSocketPool(ctx, "owner", "put_get_socket", timeout=1)
     try:
         with pytest.raises(zmq.error.Again):
-            await _round_trip(pool, peer.info, b"first", timeout=1)
+            await _round_trip(pool, peer.info, b"first")
 
         assert _idle_sockets(pool) == [], "a timed-out socket was returned to the pool"
 
         # The late reply to "first" must not surface as the answer to "second".
-        assert await _round_trip(pool, peer.info, b"second", timeout=10) == b"reply-to-second"
+        assert await _round_trip(pool, peer.info, b"second") == b"reply-to-second"
     finally:
         pool.close()
         ctx.destroy(linger=0)
@@ -141,11 +142,11 @@ async def test_timed_out_socket_is_not_reused():
 async def test_cancelled_lease_discards_socket(peer):
     """Cancellation mid-recv poisons the socket: asyncio.gather cancels siblings routinely."""
     ctx = zmq.asyncio.Context()
-    pool = ZMQSocketPool(ctx, "owner")
+    pool = ZMQSocketPool(ctx, "owner", "put_get_socket")
     leased = []
 
     async def never_answered():
-        with pool.lease(peer.info, "put_get_socket") as sock:
+        with pool.lease(peer.info) as sock:
             leased.append(sock)
             await asyncio.sleep(60)  # cancelled here, after the lease was handed out
 
@@ -166,10 +167,10 @@ async def test_cancelled_lease_discards_socket(peer):
 async def test_failed_lease_discards_socket(peer):
     """Any exception in the body poisons the socket, not just timeouts."""
     ctx = zmq.asyncio.Context()
-    pool = ZMQSocketPool(ctx, "owner")
+    pool = ZMQSocketPool(ctx, "owner", "put_get_socket")
 
     with pytest.raises(RuntimeError):
-        with pool.lease(peer.info, "put_get_socket") as sock:
+        with pool.lease(peer.info) as sock:
             await sock.send_multipart([b"req"])
             raise RuntimeError("handler blew up")
 
@@ -186,14 +187,14 @@ def test_sockets_are_not_reused_across_event_loops(peer):
     loop is the "Bad file descriptor / SIGABRT" failure this keying exists to prevent.
     """
     ctx = zmq.asyncio.Context()
-    pool = ZMQSocketPool(ctx, "owner")
+    pool = ZMQSocketPool(ctx, "owner", "put_get_socket")
     leased = []
 
     async def lease_twice(tag):
         # Twice per loop, so a socket IS reused within a loop -- which is what makes the
         # cross-loop comparison below meaningful rather than trivially true.
         for i in range(2):
-            with pool.lease(peer.info, "put_get_socket") as sock:
+            with pool.lease(peer.info) as sock:
                 leased.append(sock)
                 await sock.send_multipart([f"{tag}{i}".encode()])
                 await sock.recv_multipart()
@@ -219,11 +220,11 @@ def test_finished_loop_releases_its_sockets(peer):
     by garbage collection; the pool evicts finished owners on the next lease instead.
     """
     ctx = zmq.asyncio.Context()
-    pool = ZMQSocketPool(ctx, "owner")
+    pool = ZMQSocketPool(ctx, "owner", "put_get_socket")
     leased = []
 
     async def once():
-        with pool.lease(peer.info, "put_get_socket") as sock:
+        with pool.lease(peer.info) as sock:
             leased.append(sock)
             await sock.send_multipart([b"q"])
             await sock.recv_multipart()
@@ -251,10 +252,13 @@ def test_pooled_identities_are_unique_across_pools(peer):
     """
     ctx = zmq.asyncio.Context()
     # Same owner_id, as two processes on different nodes with equal pids would produce.
-    a, b = ZMQSocketPool(ctx, "TransferQueueClient_1234"), ZMQSocketPool(ctx, "TransferQueueClient_1234")
+    a, b = (
+        ZMQSocketPool(ctx, "TransferQueueClient_1234", "put_get_socket"),
+        ZMQSocketPool(ctx, "TransferQueueClient_1234", "put_get_socket"),
+    )
 
     async def identity_of(pool):
-        with pool.lease(peer.info, "put_get_socket") as sock:
+        with pool.lease(peer.info) as sock:
             return sock.getsockopt(zmq.IDENTITY)
 
     first, second = asyncio.run(identity_of(a)), asyncio.run(identity_of(b))
@@ -278,7 +282,7 @@ async def test_reregistered_peer_is_not_served_a_stale_socket():
     old = _Peer(peer_id="su0", tag=b"OLD:")
     new = _Peer(peer_id="su0", tag=b"NEW:")
     ctx = zmq.asyncio.Context()
-    pool = ZMQSocketPool(ctx, "owner")
+    pool = ZMQSocketPool(ctx, "owner", "put_get_socket", follow_endpoint_changes=True)
     try:
         assert await _round_trip(pool, old.info) == b"OLD:req"
         # Same id, different port -- exactly what re-registration produces.
@@ -300,7 +304,7 @@ async def test_moved_peer_does_not_accumulate_stale_buckets():
     socket that libzmq keeps trying to reconnect.
     """
     ctx = zmq.asyncio.Context()
-    pool = ZMQSocketPool(ctx, "owner")
+    pool = ZMQSocketPool(ctx, "owner", "put_get_socket", follow_endpoint_changes=True)
     moved = [_Peer(peer_id="su_moves", tag=b"E%d:" % i) for i in range(4)]
     try:
         for m in moved:
@@ -327,7 +331,7 @@ async def test_superseded_sockets_are_evicted_from_every_owner():
     old = _Peer(peer_id="su0", tag=b"OLD:")
     new = _Peer(peer_id="su0", tag=b"NEW:")
     ctx = zmq.asyncio.Context()
-    pool = ZMQSocketPool(ctx, "owner")
+    pool = ZMQSocketPool(ctx, "owner", "put_get_socket", follow_endpoint_changes=True)
     loops = []
 
     def spawn_owner():
@@ -349,7 +353,7 @@ async def test_superseded_sockets_are_evicted_from_every_owner():
         # A third owner observes the migration.
         assert run_on(spawn_owner(), new.info) == b"NEW:req"
 
-        addresses = {k.address for buckets in pool._idle.values() for k in buckets}
+        addresses = {addr for buckets in pool._idle.values() for addr in buckets}
         assert addresses == {new.info.to_addr("put_get_socket")}, f"stale addresses remain: {addresses}"
 
         # Every owner still reaches the current endpoint afterwards.
@@ -376,7 +380,7 @@ async def test_lease_in_flight_when_peer_moves_is_not_parked():
     old = _Peer(delay_first_reply=1.0, peer_id="su0", tag=b"OLD:")
     new = _Peer(peer_id="su0", tag=b"NEW:")
     ctx = zmq.asyncio.Context()
-    pool = ZMQSocketPool(ctx, "owner")
+    pool = ZMQSocketPool(ctx, "owner", "put_get_socket", follow_endpoint_changes=True)
     try:
         in_flight = asyncio.create_task(_round_trip(pool, old.info))
         await asyncio.sleep(0.2)  # let it reach recv before the peer "moves"
@@ -384,9 +388,9 @@ async def test_lease_in_flight_when_peer_moves_is_not_parked():
         assert await _round_trip(pool, new.info) == b"NEW:req"
         assert await in_flight == b"OLD:req", "the in-flight request should still complete"
 
-        keys = [k for owner in pool._idle.values() for k in owner]
-        assert len(keys) == 1, f"a superseded endpoint was parked: {[k.address for k in keys]}"
-        assert keys[0].address == new.info.to_addr("put_get_socket")
+        parked = [addr for owner in pool._idle.values() for addr in owner]
+        assert len(parked) == 1, f"a superseded endpoint was parked: {parked}"
+        assert parked[0] == new.info.to_addr("put_get_socket")
         # And the next request still reaches the current endpoint.
         assert await _round_trip(pool, new.info) == b"NEW:req"
     finally:
@@ -402,8 +406,8 @@ def test_pool_size_below_one_is_rejected():
     try:
         for bad in (-1, 0):
             with pytest.raises(ValueError, match="at least 1"):
-                ZMQSocketPool(ctx, "owner", maxsize=bad)
-        ZMQSocketPool(ctx, "owner", maxsize=1)  # the boundary is valid
+                ZMQSocketPool(ctx, "owner", "put_get_socket", maxsize=bad)
+        ZMQSocketPool(ctx, "owner", "put_get_socket", maxsize=1)  # the boundary is valid
     finally:
         ctx.destroy(linger=0)
 
@@ -411,7 +415,7 @@ def test_pool_size_below_one_is_rejected():
 def test_connect_failure_does_not_leak_a_socket(peer):
     """A socket is nobody's responsibility until it reaches a lease, so _connect closes it."""
     ctx = zmq.asyncio.Context()
-    pool = ZMQSocketPool(ctx, "owner")
+    pool = ZMQSocketPool(ctx, "owner", "put_get_socket")
     bad = ZMQServerInfo(role=Role.STORAGE, id="bad", ip="127.0.0.1", ports={"put_get_socket": -1})
 
     created = []
@@ -425,7 +429,7 @@ def test_connect_failure_does_not_leak_a_socket(peer):
     zmq_utils.create_zmq_socket = spy
     try:
         with pytest.raises(zmq.ZMQError):
-            with pool.lease(bad, "put_get_socket"):
+            with pool.lease(bad):
                 pass
     finally:
         zmq_utils.create_zmq_socket = original
@@ -440,10 +444,10 @@ def test_connect_failure_does_not_leak_a_socket(peer):
 def test_sync_caller_can_lease(peer):
     """The metrics collector leases from a plain thread, with no event loop running."""
     ctx = zmq.Context()
-    pool = ZMQSocketPool(ctx, "metrics_collector")
+    pool = ZMQSocketPool(ctx, "metrics_collector", "put_get_socket", timeout=5)
 
     for i in range(3):
-        with pool.lease(peer.info, "put_get_socket", timeout=5) as sock:
+        with pool.lease(peer.info) as sock:
             sock.send_multipart([f"m{i}".encode()])
             assert sock.recv_multipart()[0] == f"reply-to-m{i}".encode()
 
@@ -457,7 +461,7 @@ def test_sync_caller_can_lease(peer):
 async def test_pool_size_is_a_soft_cap(peer):
     """Concurrency above maxsize still gets sockets; only the steady state is bounded."""
     ctx = zmq.asyncio.Context()
-    pool = ZMQSocketPool(ctx, "owner", maxsize=2)
+    pool = ZMQSocketPool(ctx, "owner", "put_get_socket", maxsize=2)
 
     results = await asyncio.gather(*[_round_trip(pool, peer.info, f"c{i}".encode()) for i in range(8)])
     assert len(results) == 8, "a burst beyond maxsize must not be refused or blocked"
@@ -470,10 +474,10 @@ async def test_pool_size_is_a_soft_cap(peer):
 @pytest.mark.asyncio
 async def test_unknown_socket_name_is_reported(peer):
     ctx = zmq.asyncio.Context()
-    pool = ZMQSocketPool(ctx, "owner")
+    pool = ZMQSocketPool(ctx, "owner", "no_such_socket")
 
     with pytest.raises(RuntimeError, match="not configured"):
-        with pool.lease(peer.info, "no_such_socket"):
+        with pool.lease(peer.info):
             pass
 
     pool.close()
@@ -484,7 +488,7 @@ async def test_unknown_socket_name_is_reported(peer):
 async def test_close_is_idempotent_and_survives_dead_context(peer):
     """Teardown ordering is not guaranteed, so close() must tolerate a destroyed context."""
     ctx = zmq.asyncio.Context()
-    pool = ZMQSocketPool(ctx, "owner")
+    pool = ZMQSocketPool(ctx, "owner", "put_get_socket")
     await _round_trip(pool, peer.info)
 
     pool.close()
