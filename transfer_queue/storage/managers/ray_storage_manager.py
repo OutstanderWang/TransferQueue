@@ -18,7 +18,7 @@ from typing import Any
 import zmq
 
 from transfer_queue.storage.managers.base import KVStorageManager, StorageManagerFactory
-from transfer_queue.utils.zmq_utils import ZMQServerInfo
+from transfer_queue.utils.zmq_utils import ZMQServerInfo, ZMQSocketPool
 
 
 @StorageManagerFactory.register("RayStore")
@@ -30,8 +30,14 @@ class RayStorageManager(KVStorageManager):
         controller_info: ZMQServerInfo,
         config: dict[str, Any],
         zmq_context: zmq.asyncio.Context | None = None,
+        zmq_socket_pool: ZMQSocketPool | None = None,
     ):
         config = (config or {}).copy()
         if config.get("client_name") not in (None, "RayStorageClient"):
             raise ValueError(f"RayStorageManager only supports 'RayStorageClient', got: {config.get('client_name')}")
-        super().__init__(controller_info, {**config, "client_name": "RayStorageClient"}, zmq_context=zmq_context)
+        super().__init__(
+            controller_info,
+            {**config, "client_name": "RayStorageClient"},
+            zmq_context=zmq_context,
+            zmq_socket_pool=zmq_socket_pool,
+        )

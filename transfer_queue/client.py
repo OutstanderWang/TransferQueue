@@ -32,6 +32,7 @@ from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
     ZMQServerInfo,
+    ZMQSocketPool,
     with_zmq_socket,
 )
 
@@ -46,13 +47,15 @@ TQ_CLIENT_ZMQ_IO_THREADS = int(os.environ.get("TQ_CLIENT_ZMQ_IO_THREADS", 8))
 # Raising it also needs enough file descriptors (``ulimit -n``).
 TQ_CLIENT_ZMQ_MAX_SOCKETS = os.environ.get("TQ_CLIENT_ZMQ_MAX_SOCKETS") or None
 DEFAULT_CLIENT_ZMQ_MAX_SOCKETS = 8192
+# Idle sockets kept per (loop, peer, timeout) bucket. A soft cap: bursts beyond it still
+# get sockets, so this bounds the steady state rather than the peak.
+TQ_CLIENT_ZMQ_POOL_SIZE = int(os.environ.get("TQ_CLIENT_ZMQ_POOL_SIZE", 8))
 
 # Pre-bound decorator for controller socket operations.
 with_controller_socket = with_zmq_socket(
     "request_handle_socket",
-    get_identity=lambda self: self.client_id,
     get_peer=lambda self, target: self._controller,
-    get_context=lambda self: self.zmq_context,
+    get_pool=lambda self: self.zmq_socket_pool,
 )
 
 
@@ -91,8 +94,9 @@ class AsyncTransferQueueClient:
             raise TypeError(f"controller_info must be ZMQServerInfo, got {type(controller_info)}")
         self.client_id = client_id
         self._controller: ZMQServerInfo = controller_info
-        # One long-lived context per client; sockets stay per-request because ZMQ sockets
-        # are not thread-safe.
+        # One long-lived context per client, with sockets leased from a pool over it rather
+        # than built per request; a lease is exclusive because ZMQ sockets are not
+        # thread-safe and replies are matched to requests by arrival order.
         io_threads = TQ_CLIENT_ZMQ_IO_THREADS if zmq_io_threads is None else zmq_io_threads
         if io_threads < 1:
             raise ValueError(f"Client ZMQ I/O thread pool size must be at least 1, got {io_threads}")
@@ -129,6 +133,10 @@ class AsyncTransferQueueClient:
             )
             max_sockets = socket_limit
         self.zmq_context.set(zmq.MAX_SOCKETS, max_sockets)
+        # Sockets are leased from this pool and reused across requests, so the context's
+        # socket budget above is consumed by the concurrency high-water mark, not by
+        # request count. Lent to a borrowing storage manager alongside the context.
+        self.zmq_socket_pool = ZMQSocketPool(self.zmq_context, client_id, maxsize=TQ_CLIENT_ZMQ_POOL_SIZE)
 
         # Backstop for a client that is never closed, so the context and its I/O threads do
         # not leak for the process lifetime. finalize() (not __del__) also runs at
@@ -157,9 +165,9 @@ class AsyncTransferQueueClient:
     ):
         """Initialize the storage manager.
 
-        The client's long-lived ZMQ context is offered to every backend uniformly; each
-        registered manager decides whether to borrow it or keep its own, so the client
-        needs no knowledge of specific backend names.
+        The client's long-lived ZMQ context and socket pool are offered to every backend
+        uniformly; each registered manager decides whether to borrow them or keep its own,
+        so the client needs no knowledge of specific backend names.
 
         Args:
             manager_type: Type of storage manager to create. Supported types include:
@@ -174,6 +182,7 @@ class AsyncTransferQueueClient:
             controller_info=self._controller,
             config=config,
             zmq_context=self.zmq_context,
+            zmq_socket_pool=self.zmq_socket_pool,
         )
 
     async def _request_controller(
@@ -1053,6 +1062,8 @@ class AsyncTransferQueueClient:
             )
             return
         try:
+            # Close pooled sockets before the context that owns them.
+            self.zmq_socket_pool.close()
             if hasattr(self, "zmq_context") and self.zmq_context is not None:
                 self.zmq_context.destroy(linger=0)
         except Exception as e:

@@ -18,7 +18,7 @@ from typing import Any
 import zmq
 
 from transfer_queue.storage.managers.base import KVStorageManager, StorageManagerFactory
-from transfer_queue.utils.zmq_utils import ZMQServerInfo
+from transfer_queue.utils.zmq_utils import ZMQServerInfo, ZMQSocketPool
 
 
 @StorageManagerFactory.register("MooncakeStore")
@@ -36,6 +36,7 @@ class MooncakeStorageManager(KVStorageManager):
         controller_info: ZMQServerInfo,
         config: dict[str, Any],
         zmq_context: zmq.asyncio.Context | None = None,
+        zmq_socket_pool: ZMQSocketPool | None = None,
     ):
         config["client_name"] = "MooncakeStoreClient"
-        super().__init__(controller_info, config, zmq_context=zmq_context)
+        super().__init__(controller_info, config, zmq_context=zmq_context, zmq_socket_pool=zmq_socket_pool)

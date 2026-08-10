@@ -17,8 +17,9 @@
 
 with_zmq_socket used to create and term() a context per RPC call, which churned libzmq
 signaler file descriptors and crashed the process under concurrency (Bad file descriptor
--> SIGABRT). It now reuses the owner's context and only creates the socket per call, so
+-> SIGABRT). It now reuses the owner's context and leases sockets from a shared pool, so
 these tests assert every concurrent call sees the SAME context, alive until close().
+Pool-specific behavior is covered in test_zmq_socket_pool.py.
 """
 
 import asyncio
@@ -183,7 +184,37 @@ def test_simple_storage_borrows_client_context(echo_controller):
         controller_info=echo_controller.zmq_server_info,
         config=config,
         zmq_context=client.zmq_context,
+        zmq_socket_pool=client.zmq_socket_pool,
     )
+
+    client.close()
+
+
+def test_simple_storage_borrows_client_socket_pool(echo_controller):
+    """A manager borrowing the client's context must borrow its pool too.
+
+    A pool over a context it does not own would either outlive its sockets' context or be
+    closed while the lender is still leasing from it.
+    """
+    client = AsyncTransferQueueClient(
+        client_id="client_borrowed_pool",
+        controller_info=echo_controller.zmq_server_info,
+    )
+
+    with patch("transfer_queue.storage.managers.base.StorageManager._connect_to_controller"):
+        manager = AsyncSimpleStorageManager(
+            echo_controller.zmq_server_info,
+            {"zmq_info": {"storage_0": echo_controller.zmq_server_info}},
+            zmq_context=client.zmq_context,
+            zmq_socket_pool=client.zmq_socket_pool,
+        )
+
+    assert manager.zmq_socket_pool is client.zmq_socket_pool
+    assert not manager._owns_zmq_context
+
+    # Closing the borrower must leave the lender's pool usable.
+    manager.close()
+    assert not client.zmq_context.closed
 
     client.close()
 
@@ -199,6 +230,7 @@ def test_simple_storage_does_not_destroy_borrowed_context(echo_controller):
             echo_controller.zmq_server_info,
             {"zmq_info": {"storage_0": echo_controller.zmq_server_info}},
             zmq_context=client.zmq_context,
+            zmq_socket_pool=client.zmq_socket_pool,
         )
 
     assert manager.zmq_context is client.zmq_context
@@ -266,8 +298,11 @@ def test_close_skips_destroy_while_loop_thread_alive(echo_controller):
     context.destroy(linger=0)
 
 
-def _make_borrowing_manager(zmq_context):
-    """A minimal manager that borrows a caller's context, like SimpleStorage does."""
+def _make_borrowing_manager(client=None):
+    """A minimal manager borrowing *client*'s context and pool, like SimpleStorage does.
+
+    With no client it creates its own, since the two must always arrive together.
+    """
 
     class Borrower(StorageManager):
         def _connect_to_controller(self):
@@ -282,7 +317,9 @@ def _make_borrowing_manager(zmq_context):
         async def clear_data(self, *args, **kwargs):
             return None
 
-    return Borrower(None, {}, zmq_context=zmq_context)
+    if client is None:
+        return Borrower(None, {})
+    return Borrower(None, {}, zmq_context=client.zmq_context, zmq_socket_pool=client.zmq_socket_pool)
 
 
 def test_stuck_notify_thread_vetoes_destroy_of_borrowed_context(echo_controller):
@@ -295,7 +332,7 @@ def test_stuck_notify_thread_vetoes_destroy_of_borrowed_context(echo_controller)
         client_id="client_notify_thread_veto",
         controller_info=echo_controller.zmq_server_info,
     )
-    client.storage_manager = _make_borrowing_manager(client.zmq_context)
+    client.storage_manager = _make_borrowing_manager(client)
     context = client.zmq_context
 
     with patch.object(client.storage_manager._notify_thread, "is_alive", return_value=True):
@@ -314,7 +351,7 @@ def test_healthy_notify_thread_does_not_block_destroy(echo_controller):
         client_id="client_notify_thread_clean",
         controller_info=echo_controller.zmq_server_info,
     )
-    client.storage_manager = _make_borrowing_manager(client.zmq_context)
+    client.storage_manager = _make_borrowing_manager(client)
 
     client.close()
     assert client.zmq_context.closed
@@ -326,7 +363,7 @@ def test_manager_with_own_context_does_not_veto(echo_controller):
         client_id="client_independent_manager",
         controller_info=echo_controller.zmq_server_info,
     )
-    client.storage_manager = _make_borrowing_manager(None)  # creates its own context
+    client.storage_manager = _make_borrowing_manager()  # creates its own context
     assert client.storage_manager.zmq_context is not client.zmq_context
 
     # Even a stuck notify thread on an unrelated context must not block the client.
