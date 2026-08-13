@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import os
 import socket
 import time
 from collections.abc import Sequence
@@ -31,6 +32,8 @@ from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.serial_utils import decode, encode
 
 logger = get_logger(__name__)
+
+DEFAULT_ZMQ_MAX_SOCKETS = 8192
 
 
 bytestr: TypeAlias = bytes | bytearray | memoryview
@@ -303,6 +306,45 @@ def get_free_port(ip: str) -> int:
         bind_host = "::" if is_ipv6 else ""
         sock.bind((bind_host, 0))
         return sock.getsockname()[1]
+
+
+def apply_zmq_max_sockets(context: zmq.Context | zmq.asyncio.Context, *, owner_id: str = "") -> int:
+    """Set ``zmq.MAX_SOCKETS`` on a context from ``TQ_ZMQ_MAX_SOCKETS``, before opening sockets.
+
+    An env value out of range raises; the ``DEFAULT_ZMQ_MAX_SOCKETS`` fallback is clamped
+    instead, so a build with a lower ``ZMQ_SOCKET_LIMIT`` still yields a usable context.
+
+    Args:
+        context (zmq.Context | zmq.asyncio.Context): Context to configure.
+        owner_id (str): Owning actor, used to prefix the clamp log.
+
+    Returns:
+        The ceiling applied, after any clamping.
+    """
+    # NOTE(nexhu): read the env per call, not at import, so setting it after this module
+    # loads still takes effect.
+    env_value = os.environ.get("TQ_ZMQ_MAX_SOCKETS") or None
+    socket_limit = context.get(zmq.SOCKET_LIMIT)
+
+    if env_value is None:
+        max_sockets = min(DEFAULT_ZMQ_MAX_SOCKETS, socket_limit)
+        if max_sockets < DEFAULT_ZMQ_MAX_SOCKETS:
+            prefix = f"[{owner_id}]: " if owner_id else ""
+            logger.debug(f"{prefix}Clamped default ZMQ max sockets to ZMQ_SOCKET_LIMIT ({socket_limit}).")
+    else:
+        try:
+            max_sockets = int(env_value)
+        except ValueError as e:
+            # Name the variable: a bare int() error gives no clue which knob is wrong.
+            raise ValueError(f"TQ_ZMQ_MAX_SOCKETS must be an integer, got {env_value!r}") from e
+        if not 1 <= max_sockets <= socket_limit:
+            raise ValueError(
+                f"TQ_ZMQ_MAX_SOCKETS must be between 1 and this build's "
+                f"ZMQ_SOCKET_LIMIT ({socket_limit}), got {max_sockets}"
+            )
+
+    context.set(zmq.MAX_SOCKETS, max_sockets)
+    return max_sockets
 
 
 def create_zmq_socket(

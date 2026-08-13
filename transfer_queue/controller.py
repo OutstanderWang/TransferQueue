@@ -43,6 +43,7 @@ from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
     ZMQServerInfo,
+    apply_zmq_max_sockets,
     create_zmq_socket,
     format_zmq_address,
     get_free_port,
@@ -1716,6 +1717,7 @@ class TransferQueueController:
     def _init_zmq_socket(self):
         """Initialize ZMQ sockets for communication."""
         self.zmq_context = zmq.Context()
+        apply_zmq_max_sockets(self.zmq_context, owner_id=self.controller_id)
         self._node_ip = get_node_ip_address()
 
         while True:

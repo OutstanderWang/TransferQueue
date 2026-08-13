@@ -29,6 +29,7 @@ from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
     ZMQServerInfo,
+    apply_zmq_max_sockets,
     create_zmq_socket,
     format_zmq_address,
 )
@@ -375,6 +376,7 @@ class TQMetricsExporter:
         """Return a cached ZMQ DEALER socket for *su_id*, creating one if needed."""
         if self._zmq_ctx is None:
             self._zmq_ctx = zmq.Context()
+            apply_zmq_max_sockets(self._zmq_ctx, owner_id=f"metrics_collector[{self._role}]")
 
         sock = self._zmq_sockets.get(su_id)
         if sock is not None and not sock.closed:
