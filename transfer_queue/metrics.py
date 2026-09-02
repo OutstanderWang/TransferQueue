@@ -75,6 +75,9 @@ class TQMetricsExporter:
         self._storage_unit_infos: dict[str, ZMQServerInfo] = {}
         self._zmq_ctx: zmq.Context | None = None
         self._zmq_sockets: dict[str, zmq.Socket] = {}
+        # Storage units whose last metrics probe timed out, so the warning is logged on the
+        # transition instead of once per collection cycle for as long as a unit stays hung.
+        self._unresponsive_storage_units: set[str] = set()
         self._known_partition_ids: set[str] = set()
         self._known_production_labels: set[tuple[str, str]] = set()
         self._known_consumption_labels: set[tuple[str, str]] = set()
@@ -405,10 +408,24 @@ class TQMetricsExporter:
             response_frames = sock.recv_multipart(copy=False)
             response_msg = ZMQMessage.deserialize(response_frames)
             if response_msg.request_type == ZMQRequestType.METRICS_RESPONSE:
+                if su_id in self._unresponsive_storage_units:
+                    self._unresponsive_storage_units.discard(su_id)
+                    logger.warning(f"Storage unit {su_id} is answering metrics probes again.")
                 return response_msg.body
             return None
         except zmq.error.Again:
-            logger.debug(f"Timeout querying metrics from {su_id}")
+            # NOTE(nexhu): this probe is served by the storage unit's single worker thread, the
+            # same one that serves put/get, so a timeout here is the earliest evidence that the
+            # unit has stopped answering entirely. At debug level it was invisible in production
+            # and a hung unit only surfaced much later as a client-side put/get timeout.
+            if su_id not in self._unresponsive_storage_units:
+                self._unresponsive_storage_units.add(su_id)
+                logger.warning(
+                    f"Timeout ({TQ_METRICS_STORAGE_TIMEOUT}s) querying metrics from {su_id} at "
+                    f"{su_info.ip}:{su_info.ports.get('put_get_socket')}; its worker thread may be "
+                    f"dead or blocked, which would stall put/get on this unit too. "
+                    f"Logged once until it answers again."
+                )
             return None
         except Exception as e:
             logger.warning(f"Error querying metrics from {su_id}: {e}")

@@ -15,6 +15,8 @@
 
 import asyncio
 import os
+import socket
+import time
 import warnings
 from collections import defaultdict
 from collections.abc import Mapping
@@ -40,6 +42,40 @@ from transfer_queue.utils.zmq_utils import (
 logger = get_logger(__name__)
 
 TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT = int(os.environ.get("TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT", 200))  # seconds
+
+# Seconds to stay alive after a storage-unit timeout before raising; 0 disables the hold.
+# Debug aid only: raising immediately tears the Ray job down and takes the hung storage unit
+# with it, so there is nothing left to attach a profiler to. Holding keeps both ends up.
+TQ_HANG_HOLD_SECONDS = int(os.environ.get("TQ_HANG_HOLD_SECONDS", 0))
+
+
+def hold_for_postmortem(storage_manager_id: str, target_storage_unit: str, endpoint: str, operation: str) -> None:
+    """Block for ``TQ_HANG_HOLD_SECONDS`` so a hung storage unit can be inspected live.
+
+    No-op unless the env var is set, which is the production default. Blocks with
+    ``time.sleep`` rather than ``await asyncio.sleep`` deliberately: freezing the process is
+    the point, since letting sibling requests run on would keep mutating the state under
+    inspection. Only enable on a run that is already being debugged.
+
+    Args:
+        storage_manager_id (str): Requesting storage manager, for log correlation.
+        target_storage_unit (str): Storage unit that failed to answer.
+        endpoint (str): ``ip:port`` of that unit, or a placeholder when unresolved.
+        operation (str): Operation that timed out, e.g. ``get`` or ``put``.
+    """
+    if TQ_HANG_HOLD_SECONDS <= 0:
+        return
+
+    logger.critical(
+        f"[{storage_manager_id}]: holding {TQ_HANG_HOLD_SECONDS}s after the {operation} timeout on "
+        f"{target_storage_unit} ({endpoint}) to keep the scene alive; caller is pid {os.getpid()} "
+        f"on {socket.gethostname()}. On the unit's node, dump the process bound to that port "
+        f"(py-spy dump --pid <pid>): a StorageUnitWorkerThread still in the stack means it is "
+        f"blocked, its absence means the thread died. Set TQ_HANG_HOLD_SECONDS=0 to disable."
+    )
+    time.sleep(TQ_HANG_HOLD_SECONDS)
+    logger.critical(f"[{storage_manager_id}]: hold elapsed, re-raising the {operation} timeout.")
+
 
 _SU_SUBDIR = "simple_storage"
 _SU_INFO_FILE = "storage_unit_info.json"
@@ -142,6 +178,18 @@ class AsyncSimpleStorageManager(StorageManager):
             gi_lists[key].append(global_idx)
             pos_lists[key].append(pos)
         return {key: RoutingGroup(gi_lists[key], pos_lists[key]) for key in gi_lists}
+
+    def _describe_storage_unit(self, storage_unit_id: str) -> str:
+        """Return ``ip:port`` for a storage unit, for use in diagnostics.
+
+        The unit id is a random uuid4 fragment that carries no location, so a bare id in an
+        error message cannot be traced back to a node. Never raises: it is only ever called
+        while reporting another failure, and must not mask it.
+        """
+        info = self.storage_unit_infos.get(storage_unit_id)
+        if info is None:
+            return "endpoint unknown (unit not registered with this manager)"
+        return f"{info.ip}:{info.ports.get('put_get_socket')}"
 
     @staticmethod
     def _select_by_positions(field_data, positions: list[int]):
@@ -318,13 +366,16 @@ class AsyncSimpleStorageManager(StorageManager):
                 )
         except zmq.error.Again as e:
             timeout_sec = TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT
+            endpoint = self._describe_storage_unit(target_storage_unit)
             logger.error(
                 f"[{self.storage_manager_id}]: ZMQ recv timeout ({timeout_sec}s) "
-                f"during put to storage unit {target_storage_unit}. "
+                f"during put to storage unit {target_storage_unit} at {endpoint}. "
                 f"The storage unit may be overloaded or crashed."
             )
+            hold_for_postmortem(self.storage_manager_id, target_storage_unit, endpoint, "put")
             raise RuntimeError(
-                f"ZMQ recv timeout ({timeout_sec}s) during put to storage unit {target_storage_unit}"
+                f"ZMQ recv timeout ({timeout_sec}s) during put to storage unit "
+                f"{target_storage_unit} at {endpoint}"
             ) from e
         except Exception as e:
             logger.error(
@@ -462,12 +513,16 @@ class AsyncSimpleStorageManager(StorageManager):
                 )
         except zmq.error.Again as e:
             timeout_sec = TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT
+            endpoint = self._describe_storage_unit(target_storage_unit)
             logger.error(
                 f"[{self.storage_manager_id}]: ZMQ recv timeout ({timeout_sec}s) "
-                f"from storage unit {target_storage_unit}. "
+                f"from storage unit {target_storage_unit} at {endpoint}. "
                 f"The storage unit may be overloaded or crashed."
             )
-            raise RuntimeError(f"ZMQ recv timeout ({timeout_sec}s) from storage unit {target_storage_unit}") from e
+            hold_for_postmortem(self.storage_manager_id, target_storage_unit, endpoint, "get")
+            raise RuntimeError(
+                f"ZMQ recv timeout ({timeout_sec}s) from storage unit {target_storage_unit} at {endpoint}"
+            ) from e
         except Exception as e:
             logger.error(
                 f"[{self.storage_manager_id}]: Unexpected error from storage unit "

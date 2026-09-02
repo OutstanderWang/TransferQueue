@@ -274,6 +274,27 @@ class SimpleStorageUnit:
         logger.info(f"[{self.storage_unit_id}]: worker thread started...")
         perf_monitor = IntervalPerfMonitor(caller_name=f"{self.storage_unit_id}")
 
+        try:
+            self._worker_loop(worker_socket, poller, perf_monitor)
+        except BaseException:
+            logger.critical(
+                f"[{self.storage_unit_id}]: worker thread is exiting on an unhandled exception. "
+                f"This storage unit can no longer answer any request even though its process and "
+                f"ROUTER socket stay up; every client will time out until the job is restarted.",
+                exc_info=True,
+            )
+            raise
+        finally:
+            logger.info(f"[{self.storage_unit_id}]: worker stopped.")
+            poller.unregister(worker_socket)
+            worker_socket.close(linger=0)
+
+    def _worker_loop(self, worker_socket: zmq.Socket, poller: zmq.Poller, perf_monitor) -> None:
+        """Poll for requests and answer them until shutdown is signalled.
+
+        Split out of ``_worker_routine`` so socket cleanup lives in one ``finally``, and so
+        tests can drive the loop over their own socket pair without starting a Ray actor.
+        """
         while not self._shutdown_event.is_set():
             monitor = self._metrics if self._metrics is not None else perf_monitor
             try:
@@ -290,15 +311,23 @@ class SimpleStorageUnit:
                 break
 
             if worker_socket in socks:
-                # Messages received from proxy: [identity, serialized_msg_frame1, ...]
-                messages = worker_socket.recv_multipart(copy=False)
-                identity = messages[0]
-                serialized_msg = messages[1:]
-
-                request_msg = ZMQMessage.deserialize(serialized_msg)
-                operation = request_msg.request_type
-
+                # NOTE(nexhu): recv, deserialize and send must stay inside these try blocks. While
+                # they sat outside, a failure in any of them ended this thread while the actor,
+                # its ROUTER and the proxy kept queueing requests nobody would answer, so clients
+                # blocked until their own recv timeout however high it was set.
+                identity = None
+                operation = None
+                sender_id = None
                 try:
+                    # Messages received from proxy: [identity, serialized_msg_frame1, ...]
+                    messages = worker_socket.recv_multipart(copy=False)
+                    identity = messages[0]
+                    serialized_msg = messages[1:]
+
+                    request_msg = ZMQMessage.deserialize(serialized_msg)
+                    operation = request_msg.request_type
+                    sender_id = request_msg.sender_id
+
                     logger.debug(f"[{self.storage_unit_id}]: worker received operation: {operation}")
 
                     # Process request
@@ -327,9 +356,15 @@ class SimpleStorageUnit:
                             },
                         )
                 except Exception as e:
-                    logger.error(
+                    if identity is None:
+                        logger.exception(
+                            f"[{self.storage_unit_id}]: worker failed to receive or decode a request "
+                            f"({type(e).__name__}: {e}); no identity to reply to, continuing to poll"
+                        )
+                        continue
+                    logger.exception(
                         f"[{self.storage_unit_id}]: worker error during {operation} "
-                        f"from sender={request_msg.sender_id}: {type(e).__name__}: {e}"
+                        f"from sender={sender_id}: {type(e).__name__}: {e}"
                     )
                     response_msg = ZMQMessage.create(
                         request_type=ZMQRequestType.PUT_GET_ERROR,  # type: ignore[arg-type]
@@ -340,12 +375,14 @@ class SimpleStorageUnit:
                         },
                     )
 
-                # Send response back with identity for routing
-                worker_socket.send_multipart([identity] + response_msg.serialize(), copy=False)
-
-        logger.info(f"[{self.storage_unit_id}]: worker stopped.")
-        poller.unregister(worker_socket)
-        worker_socket.close(linger=0)
+                try:
+                    # Send response back with identity for routing
+                    worker_socket.send_multipart([identity] + response_msg.serialize(), copy=False)
+                except Exception as e:
+                    logger.exception(
+                        f"[{self.storage_unit_id}]: worker failed to send the {operation} response "
+                        f"({type(e).__name__}: {e}); the caller will time out on this request"
+                    )
 
     def _handle_put(self, data_parts: ZMQMessage) -> ZMQMessage:
         """
