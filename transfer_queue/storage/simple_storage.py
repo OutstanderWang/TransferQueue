@@ -53,6 +53,14 @@ TQ_NUM_THREADS = int(os.environ.get("TQ_NUM_THREADS", 8))
 TQ_STORAGE_SLOW_REQUEST_SECONDS = float(os.environ.get("TQ_STORAGE_SLOW_REQUEST_SECONDS", 5.0))
 TQ_STORAGE_LARGE_PAYLOAD_MB = float(os.environ.get("TQ_STORAGE_LARGE_PAYLOAD_MB", 256))
 
+# Accept-queue depth for the client-facing ROUTER. ZMQ's own default is 100, while somaxconn
+# on these hosts is 8192, and a full accept queue is emptied without an RST.
+TQ_STORAGE_ZMQ_BACKLOG = int(os.environ.get("TQ_STORAGE_ZMQ_BACKLOG", 4096))
+
+# Sampling period for the accept-queue probe, in seconds. 0 disables it. Sub-second because
+# the queue drains in milliseconds, so a reading taken after a hang is always zero.
+TQ_ACCEPT_PROBE_INTERVAL = float(os.environ.get("TQ_ACCEPT_PROBE_INTERVAL", 0))
+
 
 class StorageUnitData:
     """Storage unit for managing 2D data structure (samples × fields).
@@ -160,6 +168,13 @@ class SimpleStorageUnit:
         zmq_server_info: ZMQ connection information for clients.
     """
 
+    # Requests counted the moment the worker decodes one, independent of whether it completes.
+    # Class-level defaults so a unit built without __init__ (tests drive the worker loop
+    # directly) still counts instead of raising. See the increment site for why they exist.
+    _requests_arrived = 0
+    _arrivals_by_op: dict[str, int] = {}
+    _accept_probe = None
+
     def __init__(self, storage_unit_size: int | None = None):
         """Initialize a SimpleStorageUnit with the specified size.
 
@@ -171,6 +186,11 @@ class SimpleStorageUnit:
         self.storage_unit_size = storage_unit_size
 
         self.storage_data = StorageUnitData(self.storage_unit_size)
+
+        # Own copies so counts stay per unit; the class-level defaults above only exist for
+        # instances built without __init__.
+        self._requests_arrived = 0
+        self._arrivals_by_op = {}
 
         # Internal communication address for proxy and workers
         self._inproc_addr = f"inproc://simple_storage_workers_{self.storage_unit_id}"
@@ -212,6 +232,10 @@ class SimpleStorageUnit:
 
         # Frontend: ROUTER for receiving client requests
         self.put_get_socket = create_zmq_socket(self.zmq_context, zmq.ROUTER, self._node_ip)
+        # An overflowing accept queue is drained silently (tcp_abort_on_overflow=0), so it
+        # surfaces only as a client stuck in ESTABLISHED waiting for a reply that never
+        # comes. Env-tunable so an A/B run can restore ZMQ's default of 100.
+        self.put_get_socket.setsockopt(zmq.BACKLOG, TQ_STORAGE_ZMQ_BACKLOG)
 
         while True:
             try:
@@ -221,6 +245,18 @@ class SimpleStorageUnit:
             except zmq.ZMQError:
                 logger.warning(f"[{self.storage_unit_id}]: Try to bind ZMQ sockets failed, retrying...")
                 continue
+
+        if TQ_ACCEPT_PROBE_INTERVAL > 0:
+            # Imported lazily: the probe shells out to ``ss`` on a timer, so a run that has
+            # not asked for it should not even load the module.
+            from transfer_queue.utils.accept_probe import AcceptQueueProbe
+
+            self._accept_probe = AcceptQueueProbe(
+                port=self._put_get_socket_port,
+                owner_id=str(self.storage_unit_id),
+                interval_s=TQ_ACCEPT_PROBE_INTERVAL,
+            )
+            self._accept_probe.start()
 
         # Backend: DEALER for worker communication (connected via zmq.proxy)
         self.worker_socket = create_zmq_socket(self.zmq_context, zmq.DEALER, self._node_ip)
@@ -332,6 +368,18 @@ class SimpleStorageUnit:
                     request_msg = ZMQMessage.deserialize(serialized_msg)
                     operation = request_msg.request_type
                     sender_id = request_msg.sender_id
+
+                    # NOTE(weiyanwang): counted on arrival, before dispatch. The per-op counters
+                    # live inside monitor.measure() and only advance once a request completes, so
+                    # a request that arrived and never finished reads exactly like one that never
+                    # arrived. Comparing this against the manager's send tally tells the two apart.
+                    self._requests_arrived += 1
+                    # Rebind rather than mutate: the class-level default is shared, so mutating it
+                    # in place would pool every unit's counts together.
+                    self._arrivals_by_op = {
+                        **self._arrivals_by_op,
+                        str(operation): self._arrivals_by_op.get(str(operation), 0) + 1,
+                    }
 
                     logger.debug(f"[{self.storage_unit_id}]: worker received operation: {operation}")
 
@@ -578,7 +626,23 @@ class SimpleStorageUnit:
             "capacity": self.storage_unit_size,
             "active_keys": self.storage_data.active_key_count,
             "process_rss_bytes": process_rss,
+            # Reported next to but separately from op_stats below, which is derived from
+            # completion-time histograms: a gap between the two is a request that arrived and
+            # never finished, which the diagnostic probe cannot otherwise distinguish.
+            "requests_arrived": self._requests_arrived,
+            "arrivals_by_op": dict(self._arrivals_by_op),
         }
+
+        if self._accept_probe is not None:
+            stats = self._accept_probe.stats
+            metrics["accept_queue"] = {
+                "backlog": stats.backlog,
+                "peak_recv_q": stats.peak_recv_q,
+                "peak_utilization": stats.peak_utilization,
+                "sk_drops_delta": stats.sk_drops_delta,
+                "listen_overflow_delta": stats.overflow_delta,
+                "samples": stats.samples,
+            }
 
         # Include per-operation stats if Prometheus metrics are enabled
         if self._metrics is not None:
