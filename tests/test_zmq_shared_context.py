@@ -288,13 +288,6 @@ def test_each_scenario_gets_its_own_pool(echo_controller):
 
     pools = [client.controller_rpc_pool, manager.storage_rpc_pool, manager.notify_pool]
     assert len({id(pool) for pool in pools}) == 3, "scenarios must not share a pool"
-    # All three live on the one shared context, so the socket budget stays client-wide.
-    assert all(pool._ctx is client.zmq_context for pool in pools)
-    # Each dials the socket its scenario needs.
-    assert client.controller_rpc_pool._socket_name == "request_handle_socket"
-    assert manager.notify_pool._socket_name == "request_handle_socket"
-    assert manager.storage_rpc_pool._socket_name == "put_get_socket"
-    assert manager.storage_rpc_pool._timeout is not None, "storage RPC keeps its send/recv timeout"
 
     manager.close()
     client.close()

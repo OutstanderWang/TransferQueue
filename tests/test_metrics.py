@@ -16,7 +16,7 @@
 """Unit tests for the Prometheus metrics exporter (transfer_queue.metrics)."""
 
 import time
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -220,7 +220,9 @@ class TestStorageQuerySocketPool:
         ctx = zmq.Context()
         try:
             exporter = TQMetricsExporter(zmq_context=ctx)
-            assert exporter._get_socket_pool()._ctx is ctx
+            with patch("zmq.Context") as minted:
+                exporter._get_socket_pool()
+            minted.assert_not_called()
         finally:
             ctx.destroy(linger=0)
 
