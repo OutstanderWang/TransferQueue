@@ -49,7 +49,7 @@ TQ_CLIENT_ZMQ_MAX_SOCKETS = os.environ.get("TQ_CLIENT_ZMQ_MAX_SOCKETS") or None
 DEFAULT_CLIENT_ZMQ_MAX_SOCKETS = 8192
 # Idle sockets kept per (loop, endpoint) bucket, at least 1. A soft cap: bursts beyond it
 # still get sockets, so this bounds the steady state rather than the peak.
-TQ_CLIENT_ZMQ_POOL_SIZE = int(os.environ.get("TQ_CLIENT_ZMQ_POOL_SIZE", 8))
+TQ_CLIENT_ZMQ_POOL_SIZE = int(os.environ.get("TQ_CLIENT_ZMQ_POOL_SIZE", 64))
 
 # Pre-bound decorator for controller socket operations.
 with_controller_socket = with_zmq_socket(

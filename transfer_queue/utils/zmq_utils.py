@@ -411,7 +411,7 @@ class ZMQSocketPool:
         socket_name: str,
         *,
         timeout: int | None = None,
-        maxsize: int = 8,
+        maxsize: int = 64,
     ):
         """
         Args:
