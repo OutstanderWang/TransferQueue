@@ -412,7 +412,6 @@ class ZMQSocketPool:
         *,
         timeout: int | None = None,
         maxsize: int = 8,
-        follow_endpoint_changes: bool = False,
     ):
         """
         Args:
@@ -424,11 +423,6 @@ class ZMQSocketPool:
             maxsize: Idle sockets kept per bucket, at least 1. A soft cap: a burst beyond it
                 still gets sockets, and the excess is closed on return rather than made to
                 wait.
-            follow_endpoint_changes: Set when a peer's address can change under a stable id,
-                as re-registration does. Sockets are keyed by address either way, so a moved
-                peer is always dialed correctly; this additionally closes the sockets left
-                behind at the address it abandoned instead of letting them linger. Only the
-                metrics collector needs it -- elsewhere endpoints are fixed at construction.
         """
         if maxsize < 1:
             # Below 1 nothing is ever parked, so every request pays a fresh connect while
@@ -439,15 +433,12 @@ class ZMQSocketPool:
         self._socket_name = socket_name
         self._timeout = timeout
         self._maxsize = maxsize
-        self._follow_endpoint_changes = follow_endpoint_changes
         # Keyed by lease owner (see _lease_owner), then by address. The address, not the peer
         # id: a peer restarted under the same id at a new address must not be handed a socket
-        # still connected to the old one.
+        # still connected to the old one. The bucket it moved off is then never asked for
+        # again and lingers until close(), which no supported path can reach today -- adding
+        # runtime endpoint remapping means retiring those buckets too.
         self._idle: dict[Any, dict[str, list[zmq.Socket]]] = {}
-        # peer id -> the address most recently leased for it, tracked only when endpoints can
-        # move. What lets a lease returning from an abandoned address be told apart from a
-        # current one; _idle alone cannot, since an in-flight socket is not in it.
-        self._endpoints: dict[str, str] = {}
         self._lock = threading.Lock()
         # A ROUTER silently drops a second peer claiming an identity it already has, so
         # identities must not collide between processes: owner_id alone does not suffice
@@ -468,7 +459,7 @@ class ZMQSocketPool:
             raise RuntimeError(f"Socket '{self._socket_name}' not configured for server '{peer.id}'")
 
         address = format_zmq_address(peer.ip, port)
-        sock = self._take(peer.id, address) or self._connect(peer, address)
+        sock = self._take(address) or self._connect(peer, address)
         try:
             yield sock
         except BaseException:
@@ -478,7 +469,7 @@ class ZMQSocketPool:
             sock.close(linger=0)
             raise
         else:
-            self._release(peer.id, address, sock)
+            self._release(address, sock)
 
     def _owner_buckets(self) -> dict[str, list[zmq.Socket]]:
         """Buckets for the current lease owner, first evicting any owner that has finished.
@@ -492,58 +483,22 @@ class ZMQSocketPool:
             self._close_all(self._idle.pop(owner))
         return self._idle.setdefault(_lease_owner(), {})
 
-    def _take(self, peer_id: str, address: str) -> zmq.Socket | None:
+    def _take(self, address: str) -> zmq.Socket | None:
         """Pop a live idle socket for *address*, discarding any found closed."""
         with self._lock:
-            # Drop finished owners first, so the endpoint sweep never walks their buckets.
-            buckets = self._owner_buckets()
-            self._mark_current(peer_id, address)
-            bucket = buckets.get(address)
+            bucket = self._owner_buckets().get(address)
             while bucket:
                 sock = bucket.pop()
                 if not sock.closed:
                     return sock
         return None
 
-    def _mark_current(self, peer_id: str, address: str) -> None:
-        """Record *address* as *peer_id*'s current one and close sockets to the old one.
-
-        Callers must hold ``self._lock``. Recorded on acquire so a lease already in flight to
-        an abandoned address is recognised when it returns (see _release). Only this peer's
-        own former address is retired; peers that did not move keep their sockets. The sweep
-        spans every owner: an idle socket parked by an owner that then goes quiet would
-        otherwise keep reconnecting to the abandoned address forever. Sockets are only ever
-        closed here, never handed across owners.
-        """
-        if not self._follow_endpoint_changes:
-            return
-        previous = self._endpoints.get(peer_id)
-        if previous == address:
-            return  # unchanged, so nothing to retire
-        self._endpoints[peer_id] = address
-        if previous is None:
-            return  # first sighting, so this peer has left nothing behind
-        for buckets in self._idle.values():
-            retired = buckets.pop(previous, None)
-            if retired:
-                self._close_all({previous: retired})
-
-    def _superseded(self, peer_id: str, address: str) -> bool:
-        """Whether *address* is one its peer has since moved away from.
-
-        Callers must hold ``self._lock``. Unknown peers are not superseded, so a socket is
-        only ever retired because a newer address was actually seen.
-        """
-        return self._endpoints.get(peer_id, address) != address
-
-    def _release(self, peer_id: str, address: str, sock: zmq.Socket) -> None:
-        """Return a socket, closing it if already closed, superseded, or its bucket is full."""
+    def _release(self, address: str, sock: zmq.Socket) -> None:
+        """Return a socket, closing it if already closed or its bucket is full."""
         with self._lock:
-            # A caller may close the socket itself without raising, as the notify path does to
-            # discard a possibly-late ACK. A lease already in flight when the peer moved must
-            # not be parked either: it is wired to an address nobody will ask for again, and
-            # _take's sweep cannot see a socket that is out on loan.
-            if not sock.closed and not self._superseded(peer_id, address):
+            # A caller may close the socket itself without raising, as the notify path does
+            # to discard a possibly-late ACK.
+            if not sock.closed:
                 bucket = self._owner_buckets().setdefault(address, [])
                 if len(bucket) < self._maxsize:
                     bucket.append(sock)
@@ -575,7 +530,6 @@ class ZMQSocketPool:
         with self._lock:
             owned = list(self._idle.values())
             self._idle = {}
-            self._endpoints = {}
         for buckets in owned:
             self._close_all(buckets)
 

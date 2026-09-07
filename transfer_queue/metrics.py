@@ -379,9 +379,6 @@ class TQMetricsExporter:
                 "metrics_collector",
                 "put_get_socket",
                 timeout=TQ_METRICS_STORAGE_TIMEOUT,
-                # register_storage_units() can remap a storage unit id onto a new address, so
-                # sockets left at the address it moved off must be closed rather than linger.
-                follow_endpoint_changes=True,
             )
         return self._zmq_socket_pool
 
