@@ -2337,7 +2337,8 @@ class TransferQueueController:
             return self._metrics_endpoint
         from transfer_queue.metrics import TQMetricsExporter
 
-        self._metrics = TQMetricsExporter()
+        # Lend the controller's context rather than let the exporter build a second one.
+        self._metrics = TQMetricsExporter(zmq_context=self.zmq_context)
         self._metrics_endpoint = self._metrics.start(node_ip=self._node_ip, port=port)
         # Launch a daemon thread that periodically pushes controller state
         # snapshots to the exporter, keeping them process-isolated.

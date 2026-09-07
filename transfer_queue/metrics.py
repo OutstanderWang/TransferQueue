@@ -66,12 +66,21 @@ class TQMetricsExporter:
         TQ_METRICS_STORAGE_TIMEOUT   ZMQ timeout for storage queries (default 5s)
     """
 
-    def __init__(self, role: str = "controller"):
+    def __init__(self, role: str = "controller", zmq_context: zmq.Context | None = None):
+        """
+        Args:
+            role: Which process this exporter runs in; only "controller" collects from
+                storage units, so only that role needs a context.
+            zmq_context: The owner's long-lived synchronous context, borrowed for
+                storage-unit queries and never terminated here. Minting one instead would
+                add a second context and its native I/O thread with nobody to close them,
+                since the exporter lives as long as its Ray actor.
+        """
         self._start_time = time.time()
         self._process = psutil.Process()
         self._role = role
         self._storage_unit_infos: dict[str, ZMQServerInfo] = {}
-        self._zmq_ctx: zmq.Context | None = None
+        self._zmq_ctx = zmq_context
         self._zmq_socket_pool: ZMQSocketPool | None = None
         self._known_partition_ids: set[str] = set()
         self._known_production_labels: set[tuple[str, str]] = set()
@@ -373,7 +382,11 @@ class TQMetricsExporter:
     def _get_socket_pool(self) -> ZMQSocketPool:
         """Return the lazily-created socket pool for storage-unit queries."""
         if self._zmq_socket_pool is None:
-            self._zmq_ctx = zmq.Context()
+            if self._zmq_ctx is None:
+                raise RuntimeError(
+                    "TQMetricsExporter was built without a ZMQ context, so it cannot query "
+                    "storage units; pass zmq_context= from the owning process."
+                )
             self._zmq_socket_pool = ZMQSocketPool(
                 self._zmq_ctx,
                 "metrics_collector",

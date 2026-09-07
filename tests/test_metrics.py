@@ -21,6 +21,8 @@ from unittest.mock import MagicMock
 import pytest
 
 try:
+    import zmq
+
     from transfer_queue.metrics import TQMetricsExporter
 
     _HAS_DEPS = True
@@ -205,6 +207,28 @@ class TestMeasureContextManager:
 # ---------------------------------------------------------------------------
 # Test: storage unit metrics collection
 # ---------------------------------------------------------------------------
+
+
+class TestStorageQuerySocketPool:
+    def test_pool_borrows_the_owner_context(self):
+        """The exporter must query storage units over the context it was handed.
+
+        The controller already holds a long-lived synchronous context. A second one would
+        add another native I/O thread and leave a context nobody closes, since the exporter
+        lives for the whole life of its Ray actor.
+        """
+        ctx = zmq.Context()
+        try:
+            exporter = TQMetricsExporter(zmq_context=ctx)
+            assert exporter._get_socket_pool()._ctx is ctx
+        finally:
+            ctx.destroy(linger=0)
+
+    def test_missing_context_is_reported(self):
+        """Without a context there is nothing to query over, so say so rather than mint one."""
+        exporter = TQMetricsExporter()
+        with pytest.raises(RuntimeError, match="without a ZMQ context"):
+            exporter._get_socket_pool()
 
 
 class TestStorageMetricsCollection:
