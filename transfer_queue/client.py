@@ -120,7 +120,7 @@ class AsyncTransferQueueClient:
                     f"TQ_CLIENT_ZMQ_MAX_SOCKETS must be an integer, got {TQ_CLIENT_ZMQ_MAX_SOCKETS!r}"
                 ) from e
             explicitly_requested = True
-        if explicitly_requested and max_sockets < 1:
+        if max_sockets is not None and max_sockets < 1:
             # The upper bound needs ZMQ_SOCKET_LIMIT, hence a live context, but the lower one
             # does not -- so reject it before allocating anything.
             raise ValueError(f"Client ZMQ max sockets must be at least 1, got {max_sockets}")
