@@ -180,6 +180,30 @@ async def test_failed_lease_discards_socket(peer):
     ctx.destroy(linger=0)
 
 
+@pytest.mark.asyncio
+async def test_socket_closed_by_the_caller_is_not_parked(peer):
+    """A socket the body closed without raising must not occupy a pool slot.
+
+    StorageManager._notify_and_wait does exactly this: it closes the socket so a late ACK
+    cannot be read as the next request's reply, but swallows the error so a slow controller
+    does not fail the put that triggered it. The lease therefore exits cleanly.
+    """
+    ctx = zmq.asyncio.Context()
+    pool = ZMQSocketPool(ctx, "owner", "put_get_socket")
+
+    with pool.lease(peer.info) as sock:
+        await sock.send_multipart([b"req"])
+        sock.close(linger=0)  # closed, but the body returns normally
+
+    assert _idle_sockets(pool) == [], "a closed socket was returned to the pool"
+
+    # The pool still works, and the next request gets a live socket.
+    assert await _round_trip(pool, peer.info) == b"reply-to-req"
+
+    pool.close()
+    ctx.destroy(linger=0)
+
+
 def test_sockets_are_not_reused_across_event_loops(peer):
     """A socket bound to a finished loop must never be handed to another one.
 

@@ -537,12 +537,13 @@ class ZMQSocketPool:
         return self._endpoints.get(peer_id, address) != address
 
     def _release(self, peer_id: str, address: str, sock: zmq.Socket) -> None:
-        """Return a cleanly-used socket, closing it if superseded or its bucket is full."""
+        """Return a socket, closing it if already closed, superseded, or its bucket is full."""
         with self._lock:
-            # A lease that was already in flight when the peer moved must not be parked: it is
-            # wired to an address nobody will ask for again, and _take's sweep cannot see a
-            # socket that is out on loan.
-            if not self._superseded(peer_id, address):
+            # A caller may close the socket itself without raising, as the notify path does to
+            # discard a possibly-late ACK. A lease already in flight when the peer moved must
+            # not be parked either: it is wired to an address nobody will ask for again, and
+            # _take's sweep cannot see a socket that is out on loan.
+            if not sock.closed and not self._superseded(peer_id, address):
                 bucket = self._owner_buckets().setdefault(address, [])
                 if len(bucket) < self._maxsize:
                     bucket.append(sock)
