@@ -509,19 +509,24 @@ class ZMQSocketPool:
         """Record *address* as *peer_id*'s current one and close sockets to the old one.
 
         Callers must hold ``self._lock``. Recorded on acquire so a lease already in flight to
-        an abandoned address is recognised when it returns (see _release). The sweep spans
-        every owner: an idle socket parked by an owner that then goes quiet would otherwise
-        keep reconnecting to the abandoned address forever. Sockets are only ever closed
-        here, never handed across owners.
+        an abandoned address is recognised when it returns (see _release). Only this peer's
+        own former address is retired; peers that did not move keep their sockets. The sweep
+        spans every owner: an idle socket parked by an owner that then goes quiet would
+        otherwise keep reconnecting to the abandoned address forever. Sockets are only ever
+        closed here, never handed across owners.
         """
         if not self._follow_endpoint_changes:
             return
-        if self._endpoints.get(peer_id) == address:
+        previous = self._endpoints.get(peer_id)
+        if previous == address:
             return  # unchanged, so nothing to retire
         self._endpoints[peer_id] = address
+        if previous is None:
+            return  # first sighting, so this peer has left nothing behind
         for buckets in self._idle.values():
-            for stale in [addr for addr in buckets if self._superseded(peer_id, addr)]:
-                self._close_all({stale: buckets.pop(stale)})
+            retired = buckets.pop(previous, None)
+            if retired:
+                self._close_all({previous: retired})
 
     def _superseded(self, peer_id: str, address: str) -> bool:
         """Whether *address* is one its peer has since moved away from.

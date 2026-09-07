@@ -320,6 +320,40 @@ async def test_moved_peer_does_not_accumulate_stale_buckets():
 
 
 @pytest.mark.asyncio
+async def test_migration_of_one_peer_leaves_other_peers_alone():
+    """Retiring a moved peer's old address must not close sockets belonging to other peers.
+
+    The pool that tracks migrations is the metrics collector's, which queries every storage
+    unit from one pool. Sweeping every address that is not the mover's new one would drop
+    the whole fleet's sockets each time a single unit re-registers.
+    """
+    old = _Peer(peer_id="su0", tag=b"OLD:")
+    new = _Peer(peer_id="su0", tag=b"NEW:")
+    others = [_Peer(peer_id=f"su{i}", tag=b"P%d:" % i) for i in (1, 2)]
+    ctx = zmq.asyncio.Context()
+    pool = ZMQSocketPool(ctx, "metrics_collector", "put_get_socket", follow_endpoint_changes=True)
+    try:
+        # Two cycles, so every endpoint is recorded and each peer has a socket parked.
+        for _ in range(2):
+            for p in [old, *others]:
+                await _round_trip(pool, p.info)
+        parked_before = {id(sock) for sock in _idle_sockets(pool)}
+        assert len(parked_before) == 3, "each peer should hold one idle socket"
+
+        assert await _round_trip(pool, new.info) == b"NEW:req"
+
+        survivors = parked_before & {id(sock) for sock in _idle_sockets(pool)}
+        assert len(survivors) == 2, "a peer that did not move lost its pooled socket"
+        addresses = {addr for buckets in pool._idle.values() for addr in buckets}
+        assert old.info.to_addr("put_get_socket") not in addresses, "the mover's old address stayed"
+    finally:
+        pool.close()
+        ctx.destroy(linger=0)
+        for p in [old, new, *others]:
+            p.stop()
+
+
+@pytest.mark.asyncio
 async def test_superseded_sockets_are_evicted_from_every_owner():
     """A migration seen by one owner must retire the old address in all of them.
 
