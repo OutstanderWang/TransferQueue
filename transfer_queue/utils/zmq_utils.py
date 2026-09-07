@@ -422,7 +422,10 @@ class ZMQSocketPool:
             timeout: Send/recv timeout in seconds applied to every socket, or None for none.
             maxsize: Idle sockets kept per bucket, at least 1. A soft cap: a burst beyond it
                 still gets sockets, and the excess is closed on return rather than made to
-                wait.
+                wait. Counted per (owner, address), not per pool, so a pool dialling N peers
+                may hold N*maxsize idle sockets. Only the client's controller RPC pool tunes
+                this (``TQ_CONTROLLER_RPC_POOL_SIZE``); the storage RPC, notify, and metrics
+                pools take this default, the latter two holding one socket at a time anyway.
         """
         if maxsize < 1:
             # Below 1 nothing is ever parked, so every request pays a fresh connect while

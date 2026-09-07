@@ -47,9 +47,11 @@ TQ_CLIENT_ZMQ_IO_THREADS = int(os.environ.get("TQ_CLIENT_ZMQ_IO_THREADS", 8))
 # Raising it also needs enough file descriptors (``ulimit -n``).
 TQ_CLIENT_ZMQ_MAX_SOCKETS = os.environ.get("TQ_CLIENT_ZMQ_MAX_SOCKETS") or None
 DEFAULT_CLIENT_ZMQ_MAX_SOCKETS = 8192
-# Idle sockets kept per (loop, endpoint) bucket, at least 1. A soft cap: bursts beyond it
-# still get sockets, so this bounds the steady state rather than the peak.
-TQ_CLIENT_ZMQ_POOL_SIZE = int(os.environ.get("TQ_CLIENT_ZMQ_POOL_SIZE", 64))
+# Idle sockets kept per (loop, endpoint) bucket for controller RPC, at least 1. A soft cap:
+# bursts beyond it still get sockets, so this bounds the steady state rather than the peak.
+# Scoped to this one pool; the storage RPC, notify, and metrics pools take ZMQSocketPool's
+# own default, as none of them reaches a concurrency worth tuning separately.
+TQ_CONTROLLER_RPC_POOL_SIZE = int(os.environ.get("TQ_CONTROLLER_RPC_POOL_SIZE", 64))
 
 # Pre-bound decorator for controller socket operations.
 with_controller_socket = with_zmq_socket(
@@ -102,10 +104,10 @@ class AsyncTransferQueueClient:
         io_threads = TQ_CLIENT_ZMQ_IO_THREADS if zmq_io_threads is None else zmq_io_threads
         if io_threads < 1:
             raise ValueError(f"Client ZMQ I/O thread pool size must be at least 1, got {io_threads}")
-        if TQ_CLIENT_ZMQ_POOL_SIZE < 1:
+        if TQ_CONTROLLER_RPC_POOL_SIZE < 1:
             # Name the variable: the pool's own error cannot say which knob supplied the value.
             raise ValueError(
-                f"TQ_CLIENT_ZMQ_POOL_SIZE must be at least 1, got {TQ_CLIENT_ZMQ_POOL_SIZE}. "
+                f"TQ_CONTROLLER_RPC_POOL_SIZE must be at least 1, got {TQ_CONTROLLER_RPC_POOL_SIZE}. "
                 f"The pool always reuses at least one socket per endpoint; it cannot be disabled."
             )
 
@@ -159,7 +161,7 @@ class AsyncTransferQueueClient:
             self.zmq_context,
             client_id,
             "request_handle_socket",
-            maxsize=TQ_CLIENT_ZMQ_POOL_SIZE,
+            maxsize=TQ_CONTROLLER_RPC_POOL_SIZE,
         )
 
         # Backstop for a client that is never closed, so the context and its I/O threads do
