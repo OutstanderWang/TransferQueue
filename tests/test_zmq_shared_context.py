@@ -300,6 +300,34 @@ def test_each_scenario_gets_its_own_pool(echo_controller):
     client.close()
 
 
+def test_close_after_failed_handshake_still_releases_the_context(echo_controller):
+    """A manager whose base constructor raised must still tear down on close().
+
+    storage_rpc_pool is assigned after super().__init__(), so a handshake timeout leaves it
+    unset while the context and its native I/O threads are already allocated. __del__ calls
+    close() regardless, so dereferencing the pool there aborts the base teardown and leaks
+    the context.
+    """
+    built = []
+
+    def _fail(self):
+        built.append(self)
+        raise TimeoutError("handshake failed")
+
+    with patch.object(StorageManager, "_connect_to_controller", _fail):
+        with pytest.raises(TimeoutError):
+            AsyncSimpleStorageManager(
+                echo_controller.zmq_server_info,
+                {"zmq_info": {"storage_0": echo_controller.zmq_server_info}},
+            )
+
+    manager = built[0]
+    assert not hasattr(manager, "storage_rpc_pool"), "the test no longer exercises the partial-build path"
+
+    manager.close()
+    assert manager.zmq_context.closed, "the context outlived a failed construction"
+
+
 def test_simple_storage_does_not_destroy_borrowed_context(echo_controller):
     client = AsyncTransferQueueClient(
         client_id="client_borrowed_context_lifecycle",

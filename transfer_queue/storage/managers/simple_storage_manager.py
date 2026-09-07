@@ -664,6 +664,9 @@ class AsyncSimpleStorageManager(StorageManager):
 
     def close(self) -> None:
         """Close all ZMQ sockets and context to prevent resource leaks."""
-        # Before super(), which may destroy the context these sockets live on.
-        self.storage_rpc_pool.close()
+        # Before super(), which may destroy the context these sockets live on. Absent when
+        # the base constructor raised (a failed handshake does), and __del__ still calls this.
+        pool = getattr(self, "storage_rpc_pool", None)
+        if pool is not None:
+            pool.close()
         super().close()
