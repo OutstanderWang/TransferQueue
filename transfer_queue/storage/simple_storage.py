@@ -30,6 +30,7 @@ from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
 from transfer_queue.utils.zmq_utils import (
+    STORAGE_CLIENT_IDENTITY_PREFIXES,
     ZMQMessage,
     ZMQRequestType,
     ZMQServerInfo,
@@ -262,8 +263,29 @@ class SimpleStorageUnit:
     def _proxy_routine(self) -> None:
         """ZMQ proxy for message forwarding between frontend ROUTER and backend DEALER."""
         logger.info(f"[{self.storage_unit_id}]: start ZMQ proxy...")
+        assert self.put_get_socket is not None, "put_get_socket is not properly initialized"
+        front, back = self.put_get_socket, self.worker_socket
+        poller = zmq.Poller()
+        poller.register(front, zmq.POLLIN)
+        poller.register(back, zmq.POLLIN)
         try:
-            zmq.proxy(self.put_get_socket, self.worker_socket)
+            # Forwarding by hand rather than via zmq.proxy() so a non-TransferQueue peer on
+            # this exposed TCP port cannot reach the worker and terminate its request loop.
+            while not self._shutdown_event.is_set():
+                events = dict(poller.poll(1000))
+                if front in events:
+                    messages = front.recv_multipart(copy=False)
+                    identity = bytes(messages[0]) if messages else b""
+                    if not identity.startswith(STORAGE_CLIENT_IDENTITY_PREFIXES):
+                        logger.warning(
+                            "[%s]: dropping request with unrecognized ZMQ identity",
+                            self.storage_unit_id,
+                        )
+                        continue
+                    back.send_multipart(messages, copy=False)
+
+                if back in events:
+                    front.send_multipart(back.recv_multipart(copy=False), copy=False)
         except zmq.ContextTerminated:
             logger.info(f"[{self.storage_unit_id}]: ZMQ Proxy stopped gracefully (Context Terminated)")
         except Exception as e:
@@ -305,7 +327,22 @@ class SimpleStorageUnit:
                 identity = messages[0]
                 serialized_msg = messages[1:]
 
-                request_msg = ZMQMessage.deserialize(serialized_msg)
+                try:
+                    request_msg = ZMQMessage.deserialize(serialized_msg)
+                except Exception as e:
+                    # The identity filter cannot cover this: an allowed peer can still send
+                    # frames that fail to decode, and decoding here used to kill the thread.
+                    logger.error(
+                        f"[{self.storage_unit_id}]: undecodable request from "
+                        f"identity={bytes(identity)!r}: {type(e).__name__}: {e}"
+                    )
+                    error_msg = ZMQMessage.create(
+                        request_type=ZMQRequestType.PUT_GET_ERROR,  # type: ignore[arg-type]
+                        sender_id=self.storage_unit_id,
+                        body={"message": f"undecodable request: {type(e).__name__}: {e}"},
+                    )
+                    worker_socket.send_multipart([identity] + error_msg.serialize(), copy=False)
+                    continue
                 operation = request_msg.request_type
 
                 try:

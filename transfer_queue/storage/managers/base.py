@@ -36,7 +36,13 @@ from torch import Tensor
 from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.clients.base import StorageClientFactory
 from transfer_queue.utils.logging_utils import get_logger
-from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo, create_zmq_socket
+from transfer_queue.utils.zmq_utils import (
+    STORAGE_MANAGER_IDENTITY_PREFIX,
+    ZMQMessage,
+    ZMQRequestType,
+    ZMQServerInfo,
+    create_zmq_socket,
+)
 
 logger = get_logger(__name__)
 
@@ -70,7 +76,7 @@ class StorageManager(ABC):
         config: DictConfig,
         zmq_context: zmq.asyncio.Context | None = None,
     ):
-        self.storage_manager_id = f"TQ_STORAGE_{uuid4().hex[:8]}"
+        self.storage_manager_id = f"{STORAGE_MANAGER_IDENTITY_PREFIX}{uuid4().hex[:8]}"
         self.config = config
         self.controller_info = controller_info
 

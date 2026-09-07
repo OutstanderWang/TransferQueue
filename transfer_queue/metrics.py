@@ -26,6 +26,7 @@ from prometheus_client import CollectorRegistry, Counter, Gauge, Histogram
 
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
+    METRICS_COLLECTOR_IDENTITY_PREFIX,
     ZMQMessage,
     ZMQRequestType,
     ZMQServerInfo,
@@ -380,7 +381,7 @@ class TQMetricsExporter:
         if sock is not None and not sock.closed:
             return sock
 
-        identity = f"metrics_collector_{uuid4().hex[:8]}".encode()
+        identity = f"{METRICS_COLLECTOR_IDENTITY_PREFIX}{uuid4().hex[:8]}".encode()
         sock = create_zmq_socket(self._zmq_ctx, zmq.DEALER, su_info.ip, identity)
         timeout_ms = TQ_METRICS_STORAGE_TIMEOUT * 1000
         address = format_zmq_address(su_info.ip, su_info.ports["put_get_socket"])

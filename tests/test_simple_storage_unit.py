@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import time
+from uuid import uuid4
 
 import pytest
 import ray
@@ -22,15 +23,24 @@ import torch
 import zmq
 
 from transfer_queue.storage.simple_storage import SimpleStorageUnit
-from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, create_zmq_socket
+from transfer_queue.utils.zmq_utils import (
+    STORAGE_MANAGER_IDENTITY_PREFIX,
+    ZMQMessage,
+    ZMQRequestType,
+    create_zmq_socket,
+)
 
 
 class MockStorageClient:
     """Mock client for testing storage unit operations."""
 
-    def __init__(self, storage_put_get_address, storage_ip):
+    def __init__(self, storage_put_get_address, storage_ip, identity=None):
         self.context = zmq.Context()
-        self.socket = create_zmq_socket(self.context, zmq.DEALER, storage_ip)
+        # The storage proxy drops identities outside STORAGE_CLIENT_IDENTITY_PREFIXES, so mirror
+        # the prefix a real storage manager uses instead of letting ZMQ auto-assign one.
+        if identity is None:
+            identity = f"{STORAGE_MANAGER_IDENTITY_PREFIX}{uuid4().hex[:8]}".encode()
+        self.socket = create_zmq_socket(self.context, zmq.DEALER, storage_ip, identity=identity)
         self.socket.setsockopt(zmq.RCVTIMEO, 5000)  # 5 second timeout
         self.socket.connect(storage_put_get_address)
 
@@ -730,4 +740,37 @@ def test_storage_unit_checkpoint_load_missing_file(storage_setup, tmp_path):
     assert response.body["success"] is False
     assert "message" in response.body
 
+    client.close()
+
+
+def test_foreign_payload_dropped_and_unit_stays_usable(storage_setup):
+    """A non-TransferQueue peer (e.g. a TLS probe) must not stop the proxy."""
+    _, put_get_address, storage_ip = storage_setup
+
+    foreign = MockStorageClient(put_get_address, storage_ip, identity=b"foreign_probe")
+    foreign.socket.setsockopt(zmq.RCVTIMEO, 1000)
+    # A TLS ClientHello record header: what a port scanner sends to an unknown TCP port.
+    foreign.socket.send(b"\x16\x03\x01\x02\x00")
+    # Dropped before the worker, so unlike a decode failure it draws no reply at all.
+    with pytest.raises(zmq.Again):
+        foreign.socket.recv_multipart()
+    foreign.close()
+
+    client = MockStorageClient(put_get_address, storage_ip)
+    response = client.send_put(0, [0], {"val": [torch.tensor([1.0])]})
+    assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
+    client.close()
+
+
+def test_undecodable_request_answered_and_worker_survives(storage_setup):
+    """An allowed identity passes the proxy, so the worker itself must survive bad frames."""
+    _, put_get_address, storage_ip = storage_setup
+
+    client = MockStorageClient(put_get_address, storage_ip)
+    client.socket.send_multipart([b"\x16\x03\x01\x02\x00"])
+    response = ZMQMessage.deserialize(client.socket.recv_multipart(copy=False))
+    assert response.request_type == ZMQRequestType.PUT_GET_ERROR
+
+    response = client.send_put(0, [0], {"val": [torch.tensor([1.0])]})
+    assert response.request_type == ZMQRequestType.PUT_DATA_RESPONSE
     client.close()
