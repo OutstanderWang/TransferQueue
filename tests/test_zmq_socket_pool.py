@@ -13,13 +13,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for ZMQSocketPool.
+"""Tests for ZMQSocketPool's concurrency invariants.
 
 Sockets used to be created and closed per request. The pool reuses them, which is only
 safe because a lease is exclusive and a socket that did not complete a clean send/recv is
 discarded: replies carry no request id (see ZMQMessage.create), so a reply left in flight
 by a timed-out or cancelled request would be read by the next user of that socket as its
 own. test_timed_out_socket_is_not_reused pins exactly that.
+
+Each role's own reuse is asserted where that role is tested -- the client's controller RPC
+in test_client.py, the metrics collector in test_metrics.py, pool wiring and context
+lifecycle in test_zmq_shared_context.py. What is left here needs control over reply timing
+and loop lifetime that a caller-level test cannot reach.
 
 Reuse is asserted from the peer's side rather than from the pool's internals: every socket
 dials with its own ZMQ identity, so one identity across many requests means the connection
@@ -98,21 +103,6 @@ async def _round_trip(pool, peer_info, payload=b"req"):
     with pool.lease(peer_info) as sock:
         await sock.send_multipart([payload])
         return (await sock.recv_multipart())[0]
-
-
-@pytest.mark.asyncio
-async def test_socket_is_reused_across_requests(peer):
-    """Sequential requests to one peer must share a single socket."""
-    ctx = zmq.asyncio.Context()
-    pool = ZMQSocketPool(ctx, "owner", "put_get_socket")
-
-    for i in range(10):
-        assert await _round_trip(pool, peer.info, f"req{i}".encode()) == f"reply-to-req{i}".encode()
-
-    assert peer.callers == 1, "each request opened its own socket instead of reusing one"
-
-    pool.close()
-    ctx.destroy(linger=0)
 
 
 @pytest.mark.asyncio
@@ -226,22 +216,6 @@ async def test_reregistered_peer_is_not_served_a_stale_socket():
         ctx.destroy(linger=0)
         old.stop()
         new.stop()
-
-
-def test_sync_caller_can_lease(peer):
-    """The metrics collector leases from a plain thread, with no event loop running."""
-    ctx = zmq.Context()
-    pool = ZMQSocketPool(ctx, "metrics_collector", "put_get_socket", timeout=5)
-
-    for i in range(3):
-        with pool.lease(peer.info) as sock:
-            sock.send_multipart([f"m{i}".encode()])
-            assert sock.recv_multipart()[0] == f"reply-to-m{i}".encode()
-
-    assert peer.callers == 1, "a synchronous caller should reuse its socket too"
-
-    pool.close()
-    ctx.destroy(linger=0)
 
 
 @pytest.mark.asyncio

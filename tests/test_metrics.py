@@ -16,6 +16,7 @@
 """Unit tests for the Prometheus metrics exporter (transfer_queue.metrics)."""
 
 import time
+from threading import Thread
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -24,6 +25,8 @@ try:
     import zmq
 
     from transfer_queue.metrics import TQMetricsExporter
+    from transfer_queue.utils.enum_utils import Role
+    from transfer_queue.utils.zmq_utils import ZMQMessage, ZMQRequestType, ZMQServerInfo
 
     _HAS_DEPS = True
 except (ImportError, OSError):
@@ -231,6 +234,51 @@ class TestStorageQuerySocketPool:
         exporter = TQMetricsExporter()
         with pytest.raises(RuntimeError, match="without a ZMQ context"):
             exporter._get_socket_pool()
+
+    def test_collector_reuses_one_socket_per_storage_unit(self):
+        """The collector runs on a plain thread with no event loop, and must still reuse.
+
+        Its pool keys by thread rather than by loop, and the collect loop is one long-lived
+        daemon thread, so every cycle should reach a storage unit over the same connection.
+        Counted from the storage unit, which sees one ZMQ identity per socket dialled.
+        """
+        identities: set[bytes] = set()
+        ctx_peer = zmq.Context()
+        router = ctx_peer.socket(zmq.ROUTER)
+        port = router.bind_to_random_port("tcp://127.0.0.1")
+        running = True
+
+        def serve():
+            poller = zmq.Poller()
+            poller.register(router, zmq.POLLIN)
+            while running:
+                if not dict(poller.poll(50)):
+                    continue
+                identity, _ = router.recv_multipart()
+                identities.add(bytes(identity))
+                response = ZMQMessage.create(
+                    request_type=ZMQRequestType.METRICS_RESPONSE,
+                    sender_id="storage_0",
+                    body={},
+                )
+                router.send_multipart([identity, *response.serialize()])
+
+        server = Thread(target=serve, daemon=True)
+        server.start()
+
+        su_info = ZMQServerInfo(role=Role.STORAGE, id="storage_0", ip="127.0.0.1", ports={"put_get_socket": port})
+        ctx = zmq.Context()
+        try:
+            exporter = TQMetricsExporter(zmq_context=ctx)
+            for _ in range(3):
+                assert exporter._query_storage_unit(su_info, "storage_0") == {}
+            assert len(identities) == 1, "each collection cycle opened its own socket"
+        finally:
+            running = False
+            server.join(timeout=2.0)
+            ctx.destroy(linger=0)
+            router.close(linger=0)
+            ctx_peer.term()
 
 
 class TestStorageMetricsCollection:
