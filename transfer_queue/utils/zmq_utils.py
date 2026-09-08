@@ -367,7 +367,7 @@ def with_zmq_socket(
     get_peer: Callable[[Any, str | None], ZMQServerInfo],
     get_context: Callable[[Any], "zmq.asyncio.Context"],
     resolve_target: Callable[[tuple, dict], str | None] | None = None,
-    timeout: int | None = None,
+    timeout: int | Callable[[], int | None] | None = None,
 ):
     """Create a reusable async decorator for request sockets.
 
@@ -424,9 +424,13 @@ def with_zmq_socket(
                 identity = f"{owner_id}_to_{server_info.id}_{uuid4().hex[:8]}".encode()
                 sock = create_zmq_socket(context, zmq.DEALER, server_info.ip, identity=identity)
                 sock.connect(address)
-                if timeout is not None:
-                    sock.setsockopt(zmq.RCVTIMEO, timeout * 1000)
-                    sock.setsockopt(zmq.SNDTIMEO, timeout * 1000)
+                # Resolved per call so a caller can change the timeout after import. A
+                # value captured at decoration time froze whatever the env held when the
+                # module first loaded, which made the setting untestable and surprising.
+                effective_timeout = timeout() if callable(timeout) else timeout
+                if effective_timeout is not None:
+                    sock.setsockopt(zmq.RCVTIMEO, int(effective_timeout * 1000))
+                    sock.setsockopt(zmq.SNDTIMEO, int(effective_timeout * 1000))
                 kwargs["socket"] = sock
                 return await func(self, *args, **kwargs)
             finally:

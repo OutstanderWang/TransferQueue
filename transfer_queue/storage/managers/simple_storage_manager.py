@@ -54,7 +54,9 @@ with_storage_unit_socket = with_zmq_socket(
     # because the context is loop-agnostic and each socket stays per-call.
     get_context=lambda self: self.zmq_context,
     resolve_target=lambda args, kwargs: kwargs.get("target_storage_unit"),
-    timeout=TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT,
+    # Callable, not a value: a constant read here is read at import time, which pinned the
+    # timeout to whatever the env held when this module first loaded.
+    timeout=lambda: TQ_SIMPLE_STORAGE_SEND_RECV_TIMEOUT,
 )
 
 
