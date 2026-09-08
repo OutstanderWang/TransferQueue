@@ -119,6 +119,37 @@ def test_drop_increase_is_logged_at_error(caplog):
     assert "accept queue dropped a connection" in caplog.text
 
 
+def test_steady_drop_count_is_logged_once_not_every_sample(caplog):
+    """sk_drops is cumulative, so a past drop must not be re-reported forever.
+
+    Measuring against the probe's first sample made the condition permanently true once
+    the socket had ever dropped a connection: at a 0.1s interval that is ten errors a
+    second for the life of the process, and it erases when the drop actually happened.
+    """
+    probe = _probe()
+    probe._record(_sample(0, sk_drops=12))
+
+    with caplog.at_level("ERROR"):
+        probe._record(_sample(0, sk_drops=13))  # a new drop -- report it
+        for _ in range(20):
+            probe._record(_sample(0, sk_drops=13))  # unchanged -- stay quiet
+
+    assert caplog.text.count("accept queue dropped a connection") == 1
+
+
+def test_each_new_drop_is_reported(caplog):
+    """Quieting the repeat must not swallow genuinely new drops."""
+    probe = _probe()
+    probe._record(_sample(0, sk_drops=12))
+
+    with caplog.at_level("ERROR"):
+        probe._record(_sample(0, sk_drops=13))
+        probe._record(_sample(0, sk_drops=13))
+        probe._record(_sample(0, sk_drops=14))
+
+    assert caplog.text.count("accept queue dropped a connection") == 2
+
+
 def test_near_full_queue_warns_once(caplog):
     """Repeating the warning every 100ms would flood the log of a 512-node job."""
     probe = _probe()
