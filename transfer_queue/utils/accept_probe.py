@@ -197,6 +197,7 @@ class AcceptQueueProbe:
         stats = self.stats
         stats.samples += 1
         stats.backlog = sample.backlog or stats.backlog
+        previous = stats.last_sample
         if stats.first_sample is None:
             stats.first_sample = sample
         stats.last_sample = sample
@@ -206,13 +207,15 @@ class AcceptQueueProbe:
             stats.peak_utilization = sample.utilization
             stats.peak_history.append((sample.timestamp, sample.recv_q))
 
-        # A drop charged to this socket is the direct evidence the guess needs, so it
-        # is reported at error level with the depth that produced it.
-        if stats.first_sample is not None and sample.sk_drops > stats.first_sample.sk_drops:
+        # sk_drops is a monotonic kernel counter, so this compares against the previous
+        # sample rather than the first: measuring from probe start would keep reporting a
+        # drop that happened once, on every sample, and erase when it actually occurred.
+        if previous is not None and sample.sk_drops > previous.sk_drops:
             logger.error(
                 f"[{self.owner_id}]: accept queue dropped a connection on port {self.port}. "
                 f"recv_q={sample.recv_q}/{sample.backlog} sk_drops={sample.sk_drops} "
-                f"(+{sample.sk_drops - stats.first_sample.sk_drops} since probe start). "
+                f"(+{sample.sk_drops - previous.sk_drops} since the last sample, "
+                f"+{stats.sk_drops_delta} since probe start). "
                 f"A silently dropped connection leaves the client in ESTABLISHED with no "
                 f"reply; raise ZMQ_BACKLOG above {sample.backlog}."
             )
