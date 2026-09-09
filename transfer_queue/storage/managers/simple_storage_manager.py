@@ -32,6 +32,7 @@ from transfer_queue.storage.managers.base import StorageManager, StorageManagerF
 from transfer_queue.storage.simple_storage import KEY_NOT_FOUND_MARKER, StorageKeyNotFoundError
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
+    TQ_SOCKET_POOL_SIZE,
     ZMQMessage,
     ZMQRequestType,
     ZMQServerInfo,
@@ -102,6 +103,28 @@ class AsyncSimpleStorageManager(StorageManager):
             raise ValueError("AsyncSimpleStorageManager requires non-empty 'zmq_info' in config.")
 
         self.storage_unit_infos = self._register_servers(server_infos)
+        self._warn_if_pool_can_exhaust_context(len(self.storage_unit_infos))
+
+    def _warn_if_pool_can_exhaust_context(self, num_units: int) -> None:
+        """Warn when the pool may park more sockets than the context can hold.
+
+        The cap is per (owner, address), so it multiplies by storage-unit count while the
+        context ceiling does not. At a few thousand units the product passes ZMQ_MAX_SOCKETS,
+        where a lease fails with EMFILE instead of degrading.
+        """
+        try:
+            budget = self.zmq_context.get(zmq.MAX_SOCKETS)
+        except zmq.ZMQError:  # pragma: no cover - context already terminating
+            return
+        worst_case = TQ_SOCKET_POOL_SIZE * num_units
+        if worst_case > budget:
+            logger.warning(
+                f"[{self.storage_manager_id}]: storage RPC pool may hold up to "
+                f"{TQ_SOCKET_POOL_SIZE} x {num_units} = {worst_case} idle sockets, above this "
+                f"context's ZMQ_MAX_SOCKETS ({budget}). Concurrent requests can then fail to "
+                f"open a socket. Lower TQ_SOCKET_POOL_SIZE or raise TQ_CLIENT_ZMQ_MAX_SOCKETS "
+                f"(with enough file descriptors, see ulimit -n)."
+            )
 
     def _register_servers(self, server_infos: "ZMQServerInfo | dict[Any, ZMQServerInfo]"):
         """Register and validate server information.

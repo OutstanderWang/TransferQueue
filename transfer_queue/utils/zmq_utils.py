@@ -37,9 +37,10 @@ from transfer_queue.utils.serial_utils import decode, encode
 
 logger = get_logger(__name__)
 
-# Idle sockets kept per (owner, address) bucket by every ZMQSocketPool. See ZMQSocketPool
-# for what the cap does and does not bound.
-TQ_SOCKET_POOL_SIZE = int(os.environ.get("TQ_SOCKET_POOL_SIZE", 64))
+# Idle sockets kept per (owner, address) bucket by every ZMQSocketPool. Small because the
+# cap multiplies by peer count: one socket per peer already avoids the repeated handshake,
+# and a large value only helps when one peer sees concurrent requests.
+TQ_SOCKET_POOL_SIZE = int(os.environ.get("TQ_SOCKET_POOL_SIZE", 8))
 
 bytestr: TypeAlias = bytes | bytearray | memoryview
 

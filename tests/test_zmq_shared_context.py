@@ -293,6 +293,51 @@ def test_each_scenario_gets_its_own_pool(echo_controller):
     client.close()
 
 
+@pytest.mark.parametrize(
+    "pool_size, units, warns",
+    [
+        (8, 4, False),  # 32 idle sockets against a 64-socket budget
+        (8, 32, True),  # 256 would exceed it
+    ],
+)
+def test_warns_when_pool_size_times_units_exceeds_the_context(echo_controller, caplog, pool_size, units, warns):
+    """The per-address cap multiplies by storage-unit count; the context ceiling does not.
+
+    At a few thousand units the product passes ZMQ_MAX_SOCKETS, where opening a socket
+    fails outright, so the mismatch is worth naming at construction rather than at a lease.
+    """
+    client = AsyncTransferQueueClient(
+        client_id="client_pool_budget",
+        controller_info=echo_controller.zmq_server_info,
+        zmq_max_sockets=64,
+    )
+    zmq_info = {
+        f"storage_{i}": ZMQServerInfo(
+            role=Role.STORAGE,
+            id=f"storage_{i}",
+            ip="127.0.0.1",
+            ports={"put_get_socket": 5600 + i},
+        )
+        for i in range(units)
+    }
+
+    with (
+        patch("transfer_queue.storage.managers.base.StorageManager._connect_to_controller"),
+        patch("transfer_queue.storage.managers.simple_storage_manager.TQ_SOCKET_POOL_SIZE", pool_size),
+        caplog.at_level("WARNING"),
+    ):
+        manager = AsyncSimpleStorageManager(
+            echo_controller.zmq_server_info,
+            {"zmq_info": zmq_info},
+            zmq_context=client.zmq_context,
+        )
+
+    assert ("above this context's ZMQ_MAX_SOCKETS" in caplog.text) is warns
+
+    manager.close()
+    client.close()
+
+
 def test_close_after_failed_handshake_still_releases_the_context(echo_controller):
     """A manager whose base constructor raised must still tear down on close().
 
