@@ -38,10 +38,10 @@ from transfer_queue.utils.serial_utils import decode, encode
 
 logger = get_logger(__name__)
 
-# Idle sockets kept per (owner, address) bucket by every ZMQSocketPool. Small because the
-# cap multiplies by peer count: one socket per peer already avoids the repeated handshake,
-# and a large value only helps when one peer sees concurrent requests.
-TQ_SOCKET_POOL_SIZE = int(os.environ.get("TQ_SOCKET_POOL_SIZE", 8))
+# Idle sockets kept per (owner, address) bucket by every ZMQSocketPool, and with alease the
+# sockets in flight to one peer. Small because it multiplies by peer count: one socket per
+# peer already avoids the repeated handshake, and 4 x 2000 units still fits the budget.
+TQ_SOCKET_POOL_SIZE = int(os.environ.get("TQ_SOCKET_POOL_SIZE", 4))
 
 bytestr: TypeAlias = bytes | bytearray | memoryview
 
