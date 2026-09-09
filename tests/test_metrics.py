@@ -235,12 +235,12 @@ class TestStorageQuerySocketPool:
         with pytest.raises(RuntimeError, match="without a ZMQ context"):
             exporter._get_socket_pool()
 
-    def test_collector_reuses_one_socket_per_storage_unit(self):
-        """The collector runs on a plain thread with no event loop, and must still reuse.
+    def test_collector_parks_no_socket_between_queries(self):
+        """A queried unit must leave nothing in the pool.
 
-        Its pool keys by thread rather than by loop, and the collect loop is one long-lived
-        daemon thread, so every cycle should reach a storage unit over the same connection.
-        Counted from the storage unit, which sees one ZMQ identity per socket dialled.
+        Collection walks every unit once per cycle, so a parked socket is reused only a
+        cycle later while holding a slot in the controller context's budget for the whole
+        walk. At a few thousand units that budget is what runs out first.
         """
         identities: set[bytes] = set()
         ctx_peer = zmq.Context()
@@ -272,7 +272,9 @@ class TestStorageQuerySocketPool:
             exporter = TQMetricsExporter(zmq_context=ctx)
             for _ in range(3):
                 assert exporter._query_storage_unit(su_info, "storage_0") == {}
-            assert len(identities) == 1, "each collection cycle opened its own socket"
+            # A parked socket would be reused, so a fresh identity per query is the
+            # externally visible proof that nothing was kept.
+            assert len(identities) == 3, "a queried unit left its socket in the pool"
         finally:
             running = False
             server.join(timeout=2.0)

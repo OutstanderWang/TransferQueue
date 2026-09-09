@@ -408,6 +408,10 @@ class TQMetricsExporter:
                 sock.send_multipart(request_msg.serialize())
                 response_frames = sock.recv_multipart(copy=False)
                 response_msg = ZMQMessage.deserialize(response_frames)
+                # Closed rather than parked: collection walks every unit once per cycle, so a
+                # kept socket is reused only a cycle later while occupying the controller
+                # context's budget for the whole walk -- one per unit, at any scale.
+                sock.close(linger=0)
                 if response_msg.request_type == ZMQRequestType.METRICS_RESPONSE:
                     return response_msg.body
                 return None
