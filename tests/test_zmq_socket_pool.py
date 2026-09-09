@@ -133,38 +133,50 @@ async def test_timed_out_socket_is_not_reused():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("failure", ["exception", "cancellation"])
-async def test_poisoned_lease_is_discarded(peer, failure):
+async def test_poisoned_lease_is_discarded(failure):
     """A lease that did not complete cleanly must not return its socket to the pool.
 
+    The request is on the wire before the failure and its reply is still in flight, so
+    parking the socket would hand the next caller a reply belonging to someone else.
     Cancellation counts as well as a raise: asyncio.gather cancels its siblings on the
     first failure, so this is the routine case rather than an exotic one.
     """
+    # Answers the first request only after it has been abandoned, which is what leaves the
+    # stale reply in flight.
+    peer = _Peer(delay_first_reply=0.6)
     ctx = zmq.asyncio.Context()
     pool = ZMQSocketPool(ctx, "owner", "put_get_socket")
 
     async def poisoned():
-        with pool.lease(peer.info):
-            # Nothing is sent, so no reply is left in flight to confuse the next request;
-            # the socket is poisoned purely by the lease not completing.
+        with pool.lease(peer.info) as sock:
+            await sock.send_multipart([b"doomed"])
+            # Fail only once the peer has the request, so its reply really is outstanding.
+            while not peer.identities:
+                await asyncio.sleep(0.01)
             if failure == "exception":
                 raise RuntimeError("handler blew up")
             await asyncio.sleep(60)  # cancelled here, after the lease was handed out
 
-    if failure == "exception":
-        with pytest.raises(RuntimeError):
-            await poisoned()
-    else:
-        task = asyncio.create_task(poisoned())
-        await asyncio.sleep(0.1)
-        task.cancel()
-        with pytest.raises(asyncio.CancelledError):
-            await task
+    try:
+        if failure == "exception":
+            with pytest.raises(RuntimeError):
+                await poisoned()
+        else:
+            task = asyncio.create_task(poisoned())
+            while not peer.identities:
+                await asyncio.sleep(0.01)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
 
-    assert await _round_trip(pool, peer.info) == b"reply-to-req"
-    assert peer.callers == 1, "the discarded socket never reached the peer"
-
-    pool.close()
-    ctx.destroy(linger=0)
+        abandoned = set(peer.identities)
+        # The reply to "doomed" must not surface as the answer to "second".
+        assert await _round_trip(pool, peer.info, b"second") == b"reply-to-second"
+        assert set(peer.identities) - abandoned, "the poisoned socket was reused"
+    finally:
+        pool.close()
+        ctx.destroy(linger=0)
+        peer.stop()
 
 
 def test_sockets_are_not_reused_across_event_loops(peer):

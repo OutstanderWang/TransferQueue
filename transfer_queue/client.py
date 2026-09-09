@@ -726,13 +726,12 @@ class AsyncTransferQueueClient:
             RuntimeError: If communication fails or controller returns error response
 
         Example:
-            >>> async def main():
-            ...     # Get consumption status
-            ...     global_index, consumption_status = await client.async_get_consumption_status(
-            ...         task_name="generate_sequences",
-            ...         partition_id="train_0"
-            ...     )
-            ...     print(f"Global index: {global_index}, Consumption status: {consumption_status}")
+            >>> # Get consumption status
+            >>> global_index, consumption_status = await client.async_get_consumption_status(
+            ...     task_name="generate_sequences",
+            ...     partition_id="train_0"
+            ... )
+            >>> print(f"Global index: {global_index}, Consumption status: {consumption_status}")
         """
 
         try:
@@ -774,13 +773,12 @@ class AsyncTransferQueueClient:
             RuntimeError: If communication fails or controller returns error response
 
         Example:
-            >>> async def main():
-            ...     # Get production status
-            ...     global_index, production_status = await client.async_get_production_status(
-            ...         data_fields=["input_ids", "attention_mask"],
-            ...         partition_id="train_0"
-            ...     )
-            ...     print(f"Global index: {global_index}, Production status: {production_status}")
+            >>> # Get production status
+            >>> global_index, production_status = await client.async_get_production_status(
+            ...     data_fields=["input_ids", "attention_mask"],
+            ...     partition_id="train_0"
+            ... )
+            >>> print(f"Global index: {global_index}, Production status: {production_status}")
         """
         try:
             response_msg = await self._request_controller(
@@ -816,13 +814,12 @@ class AsyncTransferQueueClient:
             RuntimeError: If communication fails or controller returns error response
 
         Example:
-            >>> async def main():
-            ...     # Check if all samples have been consumed
-            ...     is_consumed = await client.async_check_consumption_status(
-            ...         task_name="generate_sequences",
-            ...         partition_id="train_0"
-            ...     )
-            ...     print(f"All samples consumed: {is_consumed}")
+            >>> # Check if all samples have been consumed
+            >>> is_consumed = await client.async_check_consumption_status(
+            ...     task_name="generate_sequences",
+            ...     partition_id="train_0"
+            ... )
+            >>> print(f"All samples consumed: {is_consumed}")
         """
 
         _, consumption_status = await self.async_get_consumption_status(
@@ -853,13 +850,12 @@ class AsyncTransferQueueClient:
             RuntimeError: If communication fails or controller returns error response
 
         Example:
-            >>> async def main():
-            ...     # Check if all samples are ready for consumption
-            ...     is_ready = await client.async_check_production_status(
-            ...         data_fields=["input_ids", "attention_mask"],
-            ...         partition_id="train_0"
-            ...     )
-            ...     print(f"All samples ready: {is_ready}")
+            >>> # Check if all samples are ready for consumption
+            >>> is_ready = await client.async_check_production_status(
+            ...     data_fields=["input_ids", "attention_mask"],
+            ...     partition_id="train_0"
+            ... )
+            >>> print(f"All samples ready: {is_ready}")
         """
         _, production_status = await self.async_get_production_status(
             data_fields=data_fields,
@@ -894,13 +890,12 @@ class AsyncTransferQueueClient:
             RuntimeError: If communication fails or controller returns error response
 
         Example:
-            >>> async def main():
-            ...     # Reset consumption for train task to re-train on same data
-            ...     success = await client.async_reset_consumption(
-            ...         partition_id="train_0",
-            ...         task_name="train"
-            ...     )
-            ...     print(f"Reset successful: {success}")
+            >>> # Reset consumption for train task to re-train on same data
+            >>> success = await client.async_reset_consumption(
+            ...     partition_id="train_0",
+            ...     task_name="train"
+            ... )
+            >>> print(f"Reset successful: {success}")
         """
         body = {"partition_id": partition_id}
         if task_name is not None:
@@ -933,9 +928,8 @@ class AsyncTransferQueueClient:
             list[str]: List of partition ids managed by the controller
 
         Example:
-            >>> async def main():
-            ...     partition_ids = await client.get_partition_list()
-            ...     print(f"Available partitions: {partition_ids}")
+            >>> partition_ids = await client.get_partition_list()
+            >>> print(f"Available partitions: {partition_ids}")
         """
         try:
             response_msg = await self._request_controller(

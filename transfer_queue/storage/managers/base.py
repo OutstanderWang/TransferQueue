@@ -378,10 +378,8 @@ class StorageManager(ABC):
     def close(self) -> None:
         """Close all ZMQ sockets/contexts and stop the notify loop."""
 
-        # A subclass may reject its config before calling super().__init__(), as the KV
-        # managers do, leaving nothing here allocated. __del__ calls close() anyway, so
-        # return rather than burying the constructor's error under an AttributeError.
-        # notify_pool is the last thing __init__ sets before its first fallible step.
+        # A subclass may reject its config before super().__init__() runs, and __del__ calls
+        # close() anyway; return rather than bury that error under an AttributeError.
         if not hasattr(self, "notify_pool"):
             return
 
