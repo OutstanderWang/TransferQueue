@@ -15,6 +15,7 @@
 
 import asyncio
 import itertools
+import os
 import socket
 import threading
 import time
@@ -36,15 +37,9 @@ from transfer_queue.utils.serial_utils import decode, encode
 
 logger = get_logger(__name__)
 
-# Identity prefixes of the peers allowed to reach a storage unit. The storage proxy drops
-# anything else, so an identity built without these prefixes is silently unreachable.
-STORAGE_MANAGER_IDENTITY_PREFIX = "TQ_STORAGE_"
-METRICS_COLLECTOR_IDENTITY_PREFIX = "metrics_collector_"
-STORAGE_CLIENT_IDENTITY_PREFIXES = (
-    STORAGE_MANAGER_IDENTITY_PREFIX.encode(),
-    METRICS_COLLECTOR_IDENTITY_PREFIX.encode(),
-)
-
+# Idle sockets kept per (owner, address) bucket by every ZMQSocketPool. See ZMQSocketPool
+# for what the cap does and does not bound.
+TQ_SOCKET_POOL_SIZE = int(os.environ.get("TQ_SOCKET_POOL_SIZE", 64))
 
 bytestr: TypeAlias = bytes | bytearray | memoryview
 
@@ -411,7 +406,7 @@ class ZMQSocketPool:
         socket_name: str,
         *,
         timeout: int | None = None,
-        maxsize: int = 64,
+        maxsize: int | None = None,
     ):
         """
         Args:
@@ -420,13 +415,15 @@ class ZMQSocketPool:
             owner_id: Identity prefix for pooled sockets, for readable peer-side logs.
             socket_name: Port key in ``ZMQServerInfo.ports`` that every lease dials.
             timeout: Send/recv timeout in seconds applied to every socket, or None for none.
-            maxsize: Idle sockets kept per bucket, at least 1. A soft cap: a burst beyond it
-                still gets sockets, and the excess is closed on return rather than made to
-                wait. Counted per (owner, address), not per pool, so a pool dialling N peers
-                may hold N*maxsize idle sockets. Only the client's controller RPC pool tunes
-                this (``TQ_CONTROLLER_RPC_POOL_SIZE``); the storage RPC, notify, and metrics
-                pools take this default, the latter two holding one socket at a time anyway.
+            maxsize: Idle sockets kept per bucket, at least 1, defaulting to
+                ``TQ_SOCKET_POOL_SIZE``. A soft cap: a burst beyond it still gets sockets,
+                and the excess is closed on return rather than made to wait. Counted per
+                (owner, address), not per pool, so a pool dialling N peers may hold
+                N*maxsize idle sockets.
         """
+        # Resolved here rather than in the signature so the env var stays patchable; a
+        # default bound at import froze whatever the environment held when this module loaded.
+        maxsize = TQ_SOCKET_POOL_SIZE if maxsize is None else maxsize
         if maxsize < 1:
             # Below 1 nothing is ever parked, so every request pays a fresh connect while
             # still looking pooled. Reject it rather than silently disable reuse.

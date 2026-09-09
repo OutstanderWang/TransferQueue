@@ -197,15 +197,15 @@ def _no_context_left_open():
 
 
 def test_client_rejects_invalid_socket_pool_size(echo_controller):
-    """A bad TQ_CONTROLLER_RPC_POOL_SIZE must name the variable, not silently disable reuse.
+    """A bad TQ_SOCKET_POOL_SIZE must name the variable, not silently disable reuse.
 
     Below 1 nothing is ever parked, so every request pays a fresh connect while the client
     still looks pooled.
     """
     for bad in (-1, 0):
-        with patch("transfer_queue.client.TQ_CONTROLLER_RPC_POOL_SIZE", bad):
+        with patch("transfer_queue.client.TQ_SOCKET_POOL_SIZE", bad):
             with _no_context_left_open() as created:
-                with pytest.raises(ValueError, match="TQ_CONTROLLER_RPC_POOL_SIZE must be at least 1"):
+                with pytest.raises(ValueError, match="TQ_SOCKET_POOL_SIZE must be at least 1"):
                     AsyncTransferQueueClient(
                         client_id="client_invalid_socket_pool",
                         controller_info=echo_controller.zmq_server_info,

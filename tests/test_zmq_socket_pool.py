@@ -33,11 +33,13 @@ was reused, and a fresh identity means the old socket was discarded.
 
 import asyncio
 import threading
+from unittest.mock import patch
 
 import pytest
 import zmq
 import zmq.asyncio
 
+import transfer_queue.utils.zmq_utils as zmq_utils
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.zmq_utils import ZMQServerInfo, ZMQSocketPool
 
@@ -241,3 +243,30 @@ async def test_burst_beyond_pool_size_is_served(peer):
 
     pool.close()
     ctx.destroy(linger=0)
+
+
+def test_pool_size_comes_from_the_env_var_at_construction():
+    """Every role's pool takes TQ_SOCKET_POOL_SIZE, resolved per pool rather than at import.
+
+    A default bound in the signature would freeze whatever the environment held when this
+    module first loaded, which is what makes such a knob look settable but do nothing.
+    """
+    ctx = zmq.Context()
+    try:
+        with patch.object(zmq_utils, "TQ_SOCKET_POOL_SIZE", 7):
+            assert ZMQSocketPool(ctx, "owner", "put_get_socket")._maxsize == 7
+            # An explicit argument still wins, which is what lets a caller opt out.
+            assert ZMQSocketPool(ctx, "owner", "put_get_socket", maxsize=3)._maxsize == 3
+    finally:
+        ctx.destroy(linger=0)
+
+
+def test_pool_size_below_one_is_rejected():
+    """Below 1 nothing is ever parked, so reuse is off while the pool still looks pooled."""
+    ctx = zmq.Context()
+    try:
+        with patch.object(zmq_utils, "TQ_SOCKET_POOL_SIZE", 0):
+            with pytest.raises(ValueError, match="at least 1"):
+                ZMQSocketPool(ctx, "owner", "put_get_socket")
+    finally:
+        ctx.destroy(linger=0)
