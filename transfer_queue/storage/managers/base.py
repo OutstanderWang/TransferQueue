@@ -276,7 +276,7 @@ class StorageManager(ABC):
         """Send a data status notification to the controller and block until ACK is received."""
         # Acquiring the lease sits outside the handler below: a missing socket name or a dead
         # context is a configuration/lifecycle fault the caller must see, not a slow ACK.
-        with self.notify_pool.lease(self.controller_info) as sock:
+        async with self.notify_pool.alease(self.controller_info) as sock:
             try:
                 await sock.send_multipart(request_msg)
                 logger.debug(

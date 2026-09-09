@@ -19,8 +19,9 @@ import os
 import socket
 import threading
 import time
-from collections.abc import Iterator, Sequence
-from contextlib import contextmanager
+from collections.abc import AsyncIterator, Iterator, Sequence
+from contextlib import asynccontextmanager, contextmanager
+from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import wraps
 from typing import Any, Callable, TypeAlias
@@ -382,6 +383,11 @@ def _owner_finished(owner: Any) -> bool:
     return owner.is_closed()
 
 
+# Addresses whose permit the current task already holds. A ContextVar because asyncio
+# copies the context per task, so siblings under one gather do not see each other's.
+_held_permits: ContextVar[frozenset[str]] = ContextVar("_held_permits", default=frozenset())
+
+
 class ZMQSocketPool:
     """Lends connected DEALER sockets for one request scenario, reusing them across calls.
 
@@ -438,6 +444,10 @@ class ZMQSocketPool:
         # restarted under the same id at a new address must not get a socket wired to the old.
         self._idle: dict[Any, dict[str, list[zmq.Socket]]] = {}
         self._lock = threading.Lock()
+        # One semaphore per (owner, address), so a caller waits for a socket to come back
+        # instead of opening an extra one. Async only: an async lease can await, while the
+        # synchronous lessee (metrics) issues one request at a time and never queues.
+        self._permits: dict[Any, dict[str, asyncio.Semaphore]] = {}
         # A ROUTER silently drops a second peer claiming an identity it already has, and
         # owner_id alone repeats across nodes because client ids are pid-derived.
         self._identity_prefix = f"{owner_id}_{uuid4().hex[:8]}"
@@ -450,12 +460,11 @@ class ZMQSocketPool:
         A plain (non-async) contextmanager on purpose: ``with`` still sees exceptions and
         ``CancelledError`` raised across ``await``s in its body, so this one definition
         serves both async and synchronous callers.
-        """
-        port = peer.ports.get(self._socket_name)
-        if port is None:
-            raise RuntimeError(f"Socket '{self._socket_name}' not configured for server '{peer.id}'")
 
-        address = format_zmq_address(peer.ip, port)
+        Concurrency beyond ``maxsize`` opens extra sockets here rather than waiting; async
+        callers that want the cap enforced use ``alease``.
+        """
+        address = self._address(peer)
         sock = self._take(address) or self._connect(peer, address)
         try:
             yield sock
@@ -468,6 +477,49 @@ class ZMQSocketPool:
         else:
             self._release(address, sock)
 
+    @asynccontextmanager
+    async def alease(self, peer: ZMQServerInfo) -> AsyncIterator[zmq.Socket]:
+        """Like ``lease``, but waits for a socket instead of opening one past ``maxsize``.
+
+        This bounds sockets in flight at ``maxsize`` per (owner, address), so the context's
+        socket budget follows configuration rather than peak concurrency.
+
+        A permit is held for the whole body, so a task that leases inside another lease can
+        wait on a permit it -- or a sibling mid-cycle -- already holds, and that hangs with
+        no timeout. Any nesting therefore raises, including across pools: an RPC's reply is
+        what releases its permit, so a second RPC belongs after the first returns. Notify
+        already works this way, running once the puts it reports have completed.
+        """
+        address = self._address(peer)
+        held = _held_permits.get()
+        if held:
+            raise RuntimeError(
+                f"Lease on {address} from a task already holding {sorted(held)}. A lease "
+                f"keeps its permit until its body ends, so nesting one inside another can "
+                f"wait on a permit that is already held and hang. Complete the outer "
+                f"request first, then start this one."
+            )
+        token = _held_permits.set(held | {address})
+        permit = self._permit(address)
+        try:
+            async with permit:
+                with self.lease(peer) as sock:
+                    yield sock
+        finally:
+            _held_permits.reset(token)
+
+    def _address(self, peer: ZMQServerInfo) -> str:
+        port = peer.ports.get(self._socket_name)
+        if port is None:
+            raise RuntimeError(f"Socket '{self._socket_name}' not configured for server '{peer.id}'")
+        return format_zmq_address(peer.ip, port)
+
+    def _permit(self, address: str) -> asyncio.Semaphore:
+        """The permit gating this (owner, address), created on first use by that owner."""
+        with self._lock:
+            # Keyed like _idle, since a semaphore belongs to the loop that awaits it.
+            return self._permits.setdefault(_lease_owner(), {}).setdefault(address, asyncio.Semaphore(self._maxsize))
+
     def _owner_buckets(self) -> dict[str, list[zmq.Socket]]:
         """Buckets for the current lease owner, first evicting any owner that has finished.
 
@@ -478,6 +530,7 @@ class ZMQSocketPool:
         """
         for owner in [o for o in self._idle if _owner_finished(o)]:
             self._close_all(self._idle.pop(owner))
+            self._permits.pop(owner, None)
         return self._idle.setdefault(_lease_owner(), {})
 
     def _take(self, address: str) -> zmq.Socket | None:
@@ -580,7 +633,7 @@ def with_zmq_socket(
             if pool is None:
                 raise RuntimeError("get_pool returned None")
 
-            with pool.lease(server_info) as sock:
+            async with pool.alease(server_info) as sock:
                 kwargs["socket"] = sock
                 return await func(self, *args, **kwargs)
 

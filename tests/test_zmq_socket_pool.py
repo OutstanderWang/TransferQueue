@@ -245,6 +245,124 @@ async def test_burst_beyond_pool_size_is_served(peer):
     ctx.destroy(linger=0)
 
 
+@pytest.mark.asyncio
+async def test_alease_caps_sockets_in_flight(peer):
+    """alease waits for a socket rather than opening one past maxsize.
+
+    This is what makes the context's socket budget a function of configuration: without it
+    the peak equals real concurrency, which at a few thousand peers exhausts ZMQ_MAX_SOCKETS
+    and fails a lease with EMFILE.
+    """
+    ctx = zmq.asyncio.Context()
+    pool = ZMQSocketPool(ctx, "owner", "put_get_socket", maxsize=4)
+
+    async def one(i):
+        async with pool.alease(peer.info) as sock:
+            await sock.send_multipart([f"c{i}".encode()])
+            return (await sock.recv_multipart())[0]
+
+    results = await asyncio.gather(*[one(i) for i in range(40)])
+
+    assert sorted(results) == sorted(f"reply-to-c{i}".encode() for i in range(40)), "a request was dropped"
+    assert peer.callers == 4, "concurrency past maxsize opened extra sockets instead of waiting"
+
+    pool.close()
+    ctx.destroy(linger=0)
+
+
+@pytest.mark.asyncio
+async def test_alease_permits_are_per_address(peer):
+    """A busy peer must not stall requests to a different one.
+
+    Permits are keyed like the buckets, so a fan-out across N peers is not serialized by a
+    cap meant to bound one peer's concurrency.
+    """
+    other = _Peer(peer_id="peer_1", tag=b"other-")
+    ctx = zmq.asyncio.Context()
+    pool = ZMQSocketPool(ctx, "owner", "put_get_socket", maxsize=1)
+
+    async def hold():
+        async with pool.alease(peer.info) as sock:
+            await sock.send_multipart([b"slow"])
+            await sock.recv_multipart()
+            await asyncio.sleep(0.3)  # keeps peer's only permit
+
+    async def other_peer():
+        async with pool.alease(other.info) as sock:
+            await sock.send_multipart([b"req"])
+            return (await sock.recv_multipart())[0]
+
+    # Would time out if one peer's permit gated the other.
+    _, reply = await asyncio.wait_for(asyncio.gather(hold(), other_peer()), timeout=5)
+    assert reply == b"other-req"
+
+    pool.close()
+    ctx.destroy(linger=0)
+    other.stop()
+
+
+@pytest.mark.asyncio
+async def test_nested_alease_raises_instead_of_hanging(peer):
+    """A lease inside another lease must fail loudly rather than wait on a held permit.
+
+    A permit is released when its body ends, so nesting can wait on one the same task --
+    or a sibling mid-cycle -- already holds. That hangs with no timeout and no error, the
+    failure mode hardest to diagnose in production.
+    """
+    ctx = zmq.asyncio.Context()
+    pool = ZMQSocketPool(ctx, "owner", "put_get_socket", maxsize=8)
+
+    with pytest.raises(RuntimeError, match="already holding"):
+        async with pool.alease(peer.info):
+            async with pool.alease(peer.info):
+                pass
+
+    # The outer permit is returned, so the pool still works.
+    async with pool.alease(peer.info) as sock:
+        await sock.send_multipart([b"after"])
+        assert (await sock.recv_multipart())[0] == b"reply-to-after"
+
+    pool.close()
+    ctx.destroy(linger=0)
+
+
+@pytest.mark.asyncio
+async def test_nesting_is_rejected_across_pools(peer):
+    """Two pools do not make nesting safe: a cycle between them deadlocks just as well.
+
+    Each task holds what the other waits for, and separate semaphores do not break that.
+    """
+    other = _Peer(peer_id="peer_1", tag=b"other-")
+    ctx = zmq.asyncio.Context()
+    first = ZMQSocketPool(ctx, "first", "put_get_socket", maxsize=1)
+    second = ZMQSocketPool(ctx, "second", "put_get_socket", maxsize=1)
+
+    with pytest.raises(RuntimeError, match="already holding"):
+        async with first.alease(peer.info):
+            async with second.alease(other.info):
+                pass
+
+    first.close()
+    second.close()
+    ctx.destroy(linger=0)
+    other.stop()
+
+
+@pytest.mark.asyncio
+async def test_consecutive_leases_are_not_nesting(peer):
+    """Leasing again after the previous body ended is the supported shape."""
+    ctx = zmq.asyncio.Context()
+    pool = ZMQSocketPool(ctx, "owner", "put_get_socket", maxsize=2)
+
+    for i in range(3):
+        async with pool.alease(peer.info) as sock:
+            await sock.send_multipart([f"s{i}".encode()])
+            assert (await sock.recv_multipart())[0] == f"reply-to-s{i}".encode()
+
+    pool.close()
+    ctx.destroy(linger=0)
+
+
 def test_pool_size_comes_from_the_env_var_at_construction():
     """Every role's pool takes TQ_SOCKET_POOL_SIZE, resolved per pool rather than at import.
 

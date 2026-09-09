@@ -140,8 +140,10 @@ async def test_shared_context_reused_across_concurrent_calls(echo_controller, mo
     assert len(results) == num_calls
     assert all(isinstance(meta, BatchMeta) for meta in results)
 
-    # Every call must have used the SAME context, and it must be the client's context.
-    assert len(seen_contexts) == num_calls
+    # Every socket must come from the SAME context, and it must be the client's. The count
+    # is bounded by the pool's cap rather than by the call count, since concurrency past it
+    # waits for a socket instead of opening one.
+    assert seen_contexts, "no socket was created at all"
     assert all(ctx is client.zmq_context for ctx in seen_contexts)
     # The shared context must NOT have been terminated by any call.
     assert not client.zmq_context.closed
