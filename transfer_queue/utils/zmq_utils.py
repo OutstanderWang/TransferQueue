@@ -436,16 +436,12 @@ class ZMQSocketPool:
         self._socket_name = socket_name
         self._timeout = timeout
         self._maxsize = maxsize
-        # Keyed by lease owner (see _lease_owner), then by address. The address, not the peer
-        # id: a peer restarted under the same id at a new address must not be handed a socket
-        # still connected to the old one. The bucket it moved off is then never asked for
-        # again and lingers until close(), which no supported path can reach today -- adding
-        # runtime endpoint remapping means retiring those buckets too.
+        # Keyed by lease owner (see _lease_owner), then by address rather than peer id: a peer
+        # restarted under the same id at a new address must not get a socket wired to the old.
         self._idle: dict[Any, dict[str, list[zmq.Socket]]] = {}
         self._lock = threading.Lock()
-        # A ROUTER silently drops a second peer claiming an identity it already has, so
-        # identities must not collide between processes: owner_id alone does not suffice
-        # (client ids are pid-derived, and pids repeat across nodes).
+        # A ROUTER silently drops a second peer claiming an identity it already has, and
+        # owner_id alone repeats across nodes because client ids are pid-derived.
         self._identity_prefix = f"{owner_id}_{uuid4().hex[:8]}"
         self._counter = itertools.count()
 

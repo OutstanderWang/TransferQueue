@@ -47,10 +47,8 @@ TQ_CLIENT_ZMQ_IO_THREADS = int(os.environ.get("TQ_CLIENT_ZMQ_IO_THREADS", 8))
 # Raising it also needs enough file descriptors (``ulimit -n``).
 TQ_CLIENT_ZMQ_MAX_SOCKETS = os.environ.get("TQ_CLIENT_ZMQ_MAX_SOCKETS") or None
 DEFAULT_CLIENT_ZMQ_MAX_SOCKETS = 8192
-# Idle sockets kept per (loop, endpoint) bucket for controller RPC, at least 1. A soft cap:
-# bursts beyond it still get sockets, so this bounds the steady state rather than the peak.
-# Scoped to this one pool; the storage RPC, notify, and metrics pools take ZMQSocketPool's
-# own default, as none of them reaches a concurrency worth tuning separately.
+# Idle sockets kept per (loop, endpoint) bucket for controller RPC; see ZMQSocketPool for
+# the cap's semantics and which pools take its default instead.
 TQ_CONTROLLER_RPC_POOL_SIZE = int(os.environ.get("TQ_CONTROLLER_RPC_POOL_SIZE", 64))
 
 # Pre-bound decorator for controller socket operations.
@@ -100,12 +98,8 @@ class AsyncTransferQueueClient:
             raise TypeError(f"controller_info must be ZMQServerInfo, got {type(controller_info)}")
         self.client_id = client_id
         self._controller: ZMQServerInfo = controller_info
-        # One long-lived context per client, with sockets leased from a pool over it rather
-        # than built per request; a lease is exclusive because ZMQ sockets are not
-        # thread-safe and replies are matched to requests by arrival order.
-        # Everything checkable without the context is checked first: the finalizer is not
-        # armed until __init__ returns, so a raise after allocation leaks the context and its
-        # native I/O threads.
+        # Check everything that does not need the context first: the finalizer is not armed
+        # until __init__ returns, so raising after allocation leaks it and its I/O threads.
         io_threads = TQ_CLIENT_ZMQ_IO_THREADS if zmq_io_threads is None else zmq_io_threads
         if io_threads < 1:
             raise ValueError(f"Client ZMQ I/O thread pool size must be at least 1, got {io_threads}")
@@ -158,10 +152,8 @@ class AsyncTransferQueueClient:
         except BaseException:
             self.zmq_context.destroy(linger=0)
             raise
-        # Sockets are leased from this pool and reused across requests, so the context's
-        # socket budget above is consumed by the concurrency high-water mark, not by
-        # request count. Controller RPC only -- the storage backend keeps its own pools, so
-        # neither scenario can disturb the other's sockets.
+        # Reused across requests, so the socket budget above is consumed by the concurrency
+        # high-water mark rather than by request count.
         self.controller_rpc_pool = ZMQSocketPool(
             self.zmq_context,
             client_id,

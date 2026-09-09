@@ -87,9 +87,8 @@ class StorageManager(ABC):
         # creates when handed nothing. Only an owner tears its context down (see close()).
         self._owns_zmq_context = zmq_context is None
         self.zmq_context = zmq.asyncio.Context() if zmq_context is None else zmq_context
-        # Notify traffic gets its own pool. It runs on a dedicated loop, so it could not share
-        # sockets with another scenario in any case, and keeping it separate means no other
-        # scenario's sockets are reachable from here.
+        # Notify runs on a dedicated loop, so it could not share sockets with another
+        # scenario in any case.
         self.notify_pool = ZMQSocketPool(self.zmq_context, self.storage_manager_id, "request_handle_socket")
         self._connect_to_controller()
 
@@ -304,10 +303,8 @@ class StorageManager(ABC):
                         )
                         return
             except Exception as e:
-                # Notification failure has always been logged rather than raised, so a slow
-                # controller does not fail the put that triggered it. Close the socket instead
-                # of reusing it: an ACK may still be in flight, and the next lessee would read
-                # it as its own reply. The pool discards a closed socket on its next lease.
+                # Logged rather than raised, so a slow controller does not fail the put. Close
+                # the socket: a late ACK would otherwise be read as the next lessee's reply.
                 logger.error(f"[{self.storage_manager_id}]: Data status update failed: {type(e).__name__}: {e}")
                 sock.close(linger=0)
 
