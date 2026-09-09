@@ -56,6 +56,11 @@ logger = get_logger(__name__)
 
 TQ_CONTROLLER_GET_METADATA_TIMEOUT = int(os.environ.get("TQ_CONTROLLER_GET_METADATA_TIMEOUT", 1))
 TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL = int(os.environ.get("TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL", 5))
+# Socket ceiling for the controller's context, above libzmq's default of 1023. The two
+# ROUTERs are all it binds, but the metrics exporter borrows this context to query storage
+# units, so the budget has to cover a large fleet. Raising it needs file descriptors to
+# match (``ulimit -n``).
+TQ_CONTROLLER_ZMQ_MAX_SOCKETS = int(os.environ.get("TQ_CONTROLLER_ZMQ_MAX_SOCKETS", 4096))
 
 # Sample pre-allocation for StreamingDataLoader compatibility.
 # By pre-allocating sample indices (typically global_batch_size), consumers can accurately
@@ -1725,6 +1730,9 @@ class TransferQueueController:
     def _init_zmq_socket(self):
         """Initialize ZMQ sockets for communication."""
         self.zmq_context = zmq.Context()
+        # Before any socket is opened on it: libzmq applies MAX_SOCKETS at socket creation.
+        socket_limit = self.zmq_context.get(zmq.SOCKET_LIMIT)
+        self.zmq_context.set(zmq.MAX_SOCKETS, min(TQ_CONTROLLER_ZMQ_MAX_SOCKETS, socket_limit))
         self._node_ip = get_node_ip_address()
 
         while True:
