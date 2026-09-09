@@ -25,7 +25,11 @@ import psutil
 import ray
 import zmq
 
-from transfer_queue.utils.common import estimate_payload_bytes, limit_pytorch_auto_parallel_threads
+from transfer_queue.utils.common import (
+    estimate_payload_bytes,
+    get_env_bool,
+    limit_pytorch_auto_parallel_threads,
+)
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
@@ -60,6 +64,14 @@ TQ_STORAGE_ZMQ_BACKLOG = int(os.environ.get("TQ_STORAGE_ZMQ_BACKLOG", 4096))
 # Sampling period for the accept-queue probe, in seconds. 0 disables it. Sub-second because
 # the queue drains in milliseconds, so a reading taken after a hang is always zero.
 TQ_ACCEPT_PROBE_INTERVAL = float(os.environ.get("TQ_ACCEPT_PROBE_INTERVAL", 0))
+
+# Exit the unit process when its worker thread dies. On by default: the worker is a daemon
+# thread, so without this the process keeps accepting requests it can never answer and every
+# caller blocks until its own timeout. Disable only to inspect a dead worker in place.
+TQ_STORAGE_EXIT_ON_WORKER_DEATH = get_env_bool("TQ_STORAGE_EXIT_ON_WORKER_DEATH", True)
+
+# Distinguishes a worker-death abort from a normal exit in Ray's actor-failure logs.
+_WORKER_DEATH_EXIT_CODE = 70
 
 
 class StorageUnitData:
@@ -301,7 +313,10 @@ class SimpleStorageUnit:
             if self._shutdown_event.is_set():
                 logger.info(f"[{self.storage_unit_id}]: ZMQ Proxy shutting down...")
             else:
-                logger.error(f"[{self.storage_unit_id}]: ZMQ Proxy unexpected error: {e}")
+                logger.exception(f"[{self.storage_unit_id}]: ZMQ Proxy unexpected error: {e}")
+                # Without the proxy nothing reaches the worker, so the unit is as unreachable
+                # as if the worker itself had died.
+                self._abort_process("the ZMQ proxy thread died")
 
     def _worker_routine(self) -> None:
         """Worker thread for processing requests."""
@@ -324,11 +339,38 @@ class SimpleStorageUnit:
                 f"ROUTER socket stay up; every client will time out until the job is restarted.",
                 exc_info=True,
             )
+            self._abort_process("the worker thread died")
             raise
         finally:
             logger.info(f"[{self.storage_unit_id}]: worker stopped.")
             poller.unregister(worker_socket)
             worker_socket.close(linger=0)
+
+    def _abort_process(self, reason: str) -> None:
+        """Kill the whole unit process so callers fail fast instead of blocking on a dead unit.
+
+        The worker runs as a daemon thread, so re-raising only unwinds that thread while the
+        process, its ROUTER and the proxy stay up and keep queueing requests nobody will ever
+        answer. ``os._exit`` skips atexit/flush handlers that could themselves block here.
+        """
+        if self._shutdown_event.is_set():
+            return
+
+        if not TQ_STORAGE_EXIT_ON_WORKER_DEATH:
+            logger.critical(
+                f"[{self.storage_unit_id}]: {reason}; staying up because "
+                f"TQ_STORAGE_EXIT_ON_WORKER_DEATH is disabled. Requests to this unit will hang."
+            )
+            return
+
+        logger.critical(
+            f"[{self.storage_unit_id}]: {reason}; exiting with code {_WORKER_DEATH_EXIT_CODE} so "
+            f"callers fail fast rather than blocking on a unit that cannot reply. "
+            f"Set TQ_STORAGE_EXIT_ON_WORKER_DEATH=0 to keep the process alive for inspection."
+        )
+        for handler in logger.handlers:
+            handler.flush()
+        os._exit(_WORKER_DEATH_EXIT_CODE)
 
     def _worker_loop(self, worker_socket: zmq.Socket, poller: zmq.Poller, perf_monitor) -> None:
         """Poll for requests and answer them until shutdown is signalled.
