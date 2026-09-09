@@ -56,10 +56,8 @@ logger = get_logger(__name__)
 
 TQ_CONTROLLER_GET_METADATA_TIMEOUT = int(os.environ.get("TQ_CONTROLLER_GET_METADATA_TIMEOUT", 1))
 TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL = int(os.environ.get("TQ_CONTROLLER_GET_METADATA_CHECK_INTERVAL", 5))
-# Socket ceiling for the controller's context, above libzmq's default of 1023. The two
-# ROUTERs are all it binds, but the metrics exporter borrows this context to query storage
-# units, so the budget has to cover a large fleet. Raising it needs file descriptors to
-# match (``ulimit -n``).
+# Above libzmq's default of 1023: the metrics exporter borrows this context to query
+# storage units, so the budget covers a fleet rather than the two ROUTERs bound here.
 TQ_CONTROLLER_ZMQ_MAX_SOCKETS = int(os.environ.get("TQ_CONTROLLER_ZMQ_MAX_SOCKETS", 4096))
 
 # Sample pre-allocation for StreamingDataLoader compatibility.
@@ -2348,8 +2346,6 @@ class TransferQueueController:
         # Lend the controller's context rather than let the exporter build a second one.
         self._metrics = TQMetricsExporter(zmq_context=self.zmq_context)
         self._metrics_endpoint = self._metrics.start(node_ip=self._node_ip, port=port)
-        # Launch a daemon thread that periodically pushes controller state
-        # snapshots to the exporter, keeping them process-isolated.
         self._metrics_snapshot_thread = Thread(
             target=self._metrics_snapshot_loop,
             name="TQMetricsSnapshotThread",

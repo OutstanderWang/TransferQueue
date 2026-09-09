@@ -38,9 +38,8 @@ from transfer_queue.utils.serial_utils import decode, encode
 
 logger = get_logger(__name__)
 
-# Idle sockets kept per (owner, address) bucket by every ZMQSocketPool, and with alease the
-# sockets in flight to one peer. Small because it multiplies by peer count: one socket per
-# peer already avoids the repeated handshake, and 4 x 2000 units still fits the budget.
+# Cap for every pool; see ZMQSocketPool for what it bounds. Small because it multiplies by
+# peer count, and one socket per peer already avoids the repeated handshake.
 TQ_SOCKET_POOL_SIZE = int(os.environ.get("TQ_SOCKET_POOL_SIZE", 4))
 
 bytestr: TypeAlias = bytes | bytearray | memoryview
@@ -444,9 +443,8 @@ class ZMQSocketPool:
         # restarted under the same id at a new address must not get a socket wired to the old.
         self._idle: dict[Any, dict[str, list[zmq.Socket]]] = {}
         self._lock = threading.Lock()
-        # One semaphore per (owner, address), so a caller waits for a socket to come back
-        # instead of opening an extra one. Async only: an async lease can await, while the
-        # synchronous lessee (metrics) issues one request at a time and never queues.
+        # One semaphore per (owner, address), keyed like _idle because a semaphore belongs
+        # to the loop that awaits it. Used by alease only; see there.
         self._permits: dict[Any, dict[str, asyncio.Semaphore]] = {}
         # A ROUTER silently drops a second peer claiming an identity it already has, and
         # owner_id alone repeats across nodes because client ids are pid-derived.
@@ -470,8 +468,7 @@ class ZMQSocketPool:
             yield sock
         except BaseException:
             # Poisoned: the request may already be on the wire, so its reply could still
-            # arrive and the next lessee would read it as its own. Timeouts and
-            # cancellation count -- asyncio.gather cancels siblings on the first failure.
+            # arrive and the next lessee would read it as its own. Cancellation counts too.
             sock.close(linger=0)
             raise
         else:
@@ -517,7 +514,6 @@ class ZMQSocketPool:
     def _permit(self, address: str) -> asyncio.Semaphore:
         """The permit gating this (owner, address), created on first use by that owner."""
         with self._lock:
-            # Keyed like _idle, since a semaphore belongs to the loop that awaits it.
             return self._permits.setdefault(_lease_owner(), {}).setdefault(address, asyncio.Semaphore(self._maxsize))
 
     def _owner_buckets(self) -> dict[str, list[zmq.Socket]]:

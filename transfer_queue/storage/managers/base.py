@@ -399,9 +399,8 @@ class StorageManager(ABC):
             else:
                 logger.debug(f"[{self.storage_manager_id}]: Notify ZMQ thread shut down.")
 
-        # This manager always owns its notify pool, even over a borrowed context. Only after
-        # the notify thread is gone, since Socket.close() is not thread-safe and that thread
-        # holds the leases; linger=0 means this cannot hang.
+        # This manager always owns its notify pool, even over a borrowed context. Only once
+        # the notify thread is gone: Socket.close() is not thread-safe and it holds the leases.
         if notify_thread_stopped:
             self.notify_pool.close()
 

@@ -50,8 +50,6 @@ _SU_INFO_FILE = "storage_unit_info.json"
 # Pre-bound decorator for storage-unit socket operations.
 with_storage_unit_socket = with_zmq_socket(
     get_peer=lambda self, target: self.storage_unit_infos[target],
-    # Storage RPC has its own pool, separate from the notify pool on the same context: the
-    # two dial different peers with different timeouts and could never share a socket.
     get_pool=lambda self: self.storage_rpc_pool,
     resolve_target=lambda args, kwargs: kwargs.get("target_storage_unit"),
 )
