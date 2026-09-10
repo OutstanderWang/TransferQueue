@@ -25,7 +25,7 @@ import psutil
 import ray
 import zmq
 
-from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads
+from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads, log_heavy_operation
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
@@ -36,6 +36,7 @@ from transfer_queue.utils.zmq_utils import (
     ZMQServerInfo,
     create_zmq_socket,
     format_zmq_address,
+    frame_nbytes,
     get_free_port,
     get_node_ip_address,
 )
@@ -344,6 +345,7 @@ class SimpleStorageUnit:
                     worker_socket.send_multipart([identity] + error_msg.serialize(), copy=False)
                     continue
                 operation = request_msg.request_type
+                started = time.perf_counter()
 
                 try:
                     logger.debug(f"[{self.storage_unit_id}]: worker received operation: {operation}")
@@ -388,7 +390,18 @@ class SimpleStorageUnit:
                     )
 
                 # Send response back with identity for routing
-                worker_socket.send_multipart([identity] + response_msg.serialize(), copy=False)
+                response_frames = response_msg.serialize()
+                if operation == ZMQRequestType.GET_DATA:  # type: ignore[arg-type]
+                    # This end serializes the get response, so its frames give the true wire size.
+                    log_heavy_operation(
+                        self.storage_unit_id,
+                        "get",
+                        time.perf_counter() - started,
+                        sum(frame_nbytes(frame) or 0 for frame in response_frames),
+                        f"samples={len(request_msg.body.get('global_indexes', []))} "
+                        f"fields={list(request_msg.body.get('fields', []))}",
+                    )
+                worker_socket.send_multipart([identity] + response_frames, copy=False)
 
         logger.info(f"[{self.storage_unit_id}]: worker stopped.")
         poller.unregister(worker_socket)
