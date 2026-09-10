@@ -21,6 +21,8 @@ The probe turns that guess into a measurement, so these tests pin the arithmetic
 reports and the levels it logs at.
 """
 
+import threading
+
 from transfer_queue.utils.accept_probe import (
     AcceptQueueProbe,
     AcceptQueueSample,
@@ -179,3 +181,39 @@ def test_listen_overflows_returns_two_non_negative_ints():
 
 def test_sampling_an_unused_port_returns_none():
     assert sample_accept_queue(1) is None
+
+
+def test_unit_shutdown_stops_the_probe():
+    """Nothing else calls stop(), so the sampling thread would outlive the unit."""
+    from unittest.mock import MagicMock
+
+    from transfer_queue.storage.simple_storage import SimpleStorageUnit
+
+    unit_class = SimpleStorageUnit.__ray_metadata__.modified_class
+    probe = MagicMock()
+
+    unit_class._shutdown_resources(
+        shutdown_event=threading.Event(),
+        worker_thread=None,
+        proxy_thread=None,
+        zmq_context=None,
+        put_get_socket=None,
+        accept_probe=probe,
+    )
+
+    probe.stop.assert_called_once()
+
+
+def test_shutdown_without_a_probe_is_a_no_op():
+    """The probe is opt-in, so the default path must not require one."""
+    from transfer_queue.storage.simple_storage import SimpleStorageUnit
+
+    unit_class = SimpleStorageUnit.__ray_metadata__.modified_class
+
+    unit_class._shutdown_resources(
+        shutdown_event=threading.Event(),
+        worker_thread=None,
+        proxy_thread=None,
+        zmq_context=None,
+        put_get_socket=None,
+    )

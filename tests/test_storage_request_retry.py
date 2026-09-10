@@ -147,7 +147,12 @@ def test_log_heavy_operation_thresholds(caplog, elapsed, payload_bytes, should_l
 @pytest.mark.parametrize(
     "tcp_result, probe_result, expected",
     [
-        ((None, None), {"active_keys": 4, "op_stats": {"GET_DATA": {"request_count": 1025}}}, "request_lost"),
+        # A serving unit that decoded no such request never received the one that timed out.
+        ((None, None), {"active_keys": 4, "arrivals_by_op": {"GET_DATA": 0}}, "request_lost_in_flight"),
+        # A unit that resumed inside the probe window answers too, having finished it late.
+        ((None, None), {"active_keys": 4, "arrivals_by_op": {"GET_DATA": 9}}, "arrived_but_unfinished"),
+        # Without arrival counters the probe only proves the unit is serving now.
+        ((None, None), {"active_keys": 4}, "unit_serving_again"),
         ((None, None), zmq.error.Again(), "unit_not_serving"),
         (ConnectionRefusedError(), zmq.error.Again(), "tcp=down(ConnectionRefusedError)"),
     ],
@@ -165,9 +170,23 @@ async def test_diagnosis_classifies_the_failure(tcp_result, probe_result, expect
     )
 
     with patch.object(ssm.asyncio, "open_connection", tcp), patch.object(manager, "_probe_storage_unit", probe):
-        diagnosis = await manager._diagnose_storage_unit("unit_a")
+        diagnosis = await manager._diagnose_storage_unit("unit_a", "get")
 
     assert expected in diagnosis
+
+
+def test_diagnosis_does_not_report_empty_op_stats_as_zero_traffic():
+    """op_stats is Prometheus-gated, so an empty dict must not read as 'served nothing'."""
+    described = ssm._describe_unit_state({"requests_arrived": 7, "active_keys": 1})
+
+    assert "completed=unavailable(prometheus_disabled)" in described
+    assert "completed={}" not in described
+
+
+def test_arrival_key_for_get_is_the_enum_name_not_its_wire_value():
+    """The unit keys arrivals by ZMQRequestType.name; the value is the short token 'GET'."""
+    assert ssm._ARRIVAL_KEY_BY_OPERATION["get"] == "GET_DATA"
+    assert ssm._ARRIVAL_KEY_BY_OPERATION["put"] == "PUT_DATA"
 
 
 @pytest.mark.asyncio

@@ -43,6 +43,7 @@ from transfer_queue.utils.zmq_utils import (
 
 if TYPE_CHECKING:
     from transfer_queue.metrics import TQMetricsExporter
+    from transfer_queue.utils.accept_probe import AcceptQueueProbe
 
 logger = get_logger(__name__)
 
@@ -226,6 +227,7 @@ class SimpleStorageUnit:
             self.proxy_thread,
             self.zmq_context,
             self.put_get_socket,
+            self._accept_probe,
         )
 
     def _init_zmq_socket(self) -> None:
@@ -387,7 +389,10 @@ class SimpleStorageUnit:
                     # Counted on arrival, unlike op_stats which only advances on completion, so a
                     # gap between the two isolates requests that arrived and never finished.
                     self._requests_arrived += 1
-                    self._arrivals_by_op[str(operation)] = self._arrivals_by_op.get(str(operation), 0) + 1
+                    # Keyed by name, not str() or value: str() renders as
+                    # "ZMQRequestType.GET_DATA" and the value is the short wire token "GET",
+                    # while op_stats below is keyed "GET_DATA". Only name lets the two join.
+                    self._arrivals_by_op[operation.name] = self._arrivals_by_op.get(operation.name, 0) + 1
 
                     logger.debug(f"[{self.storage_unit_id}]: worker received operation: {operation}")
 
@@ -798,12 +803,18 @@ class SimpleStorageUnit:
         proxy_thread: Thread | None,
         zmq_context: zmq.Context | None,
         put_get_socket: zmq.Socket | None,
+        accept_probe: "AcceptQueueProbe | None" = None,
     ) -> None:
         """Clean up resources on garbage collection."""
         logger.info("Shutting down SimpleStorageUnit resources...")
 
         # Signal all threads to stop
         shutdown_event.set()
+
+        # Stop before the ZMQ teardown: the probe samples on its own timer and would keep
+        # spawning `ss` after the unit is gone, and stopping it logs the window summary.
+        if accept_probe is not None:
+            accept_probe.stop()
 
         # Terminate put_get_socket
         if put_get_socket:
