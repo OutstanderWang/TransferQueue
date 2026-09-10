@@ -37,6 +37,7 @@ from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.clients.base import StorageClientFactory
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.zmq_utils import (
+    STORAGE_MANAGER_IDENTITY_PREFIX,
     ZMQMessage,
     ZMQRequestType,
     ZMQServerInfo,

@@ -389,7 +389,9 @@ class TQMetricsExporter:
                 )
             self._zmq_socket_pool = ZMQSocketPool(
                 self._zmq_ctx,
-                "metrics_collector",
+                # The storage proxy drops identities without this prefix, and the pool
+                # builds each socket's identity from the owner id.
+                METRICS_COLLECTOR_IDENTITY_PREFIX.rstrip("_"),
                 "put_get_socket",
                 timeout=TQ_METRICS_STORAGE_TIMEOUT,
             )

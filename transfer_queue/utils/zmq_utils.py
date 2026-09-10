@@ -38,6 +38,15 @@ from transfer_queue.utils.serial_utils import decode, encode
 
 logger = get_logger(__name__)
 
+# Identity prefixes of the peers allowed to reach a storage unit. The storage proxy drops
+# anything else, so an identity built without these prefixes is silently unreachable.
+STORAGE_MANAGER_IDENTITY_PREFIX = "TQ_STORAGE_"
+METRICS_COLLECTOR_IDENTITY_PREFIX = "metrics_collector_"
+STORAGE_CLIENT_IDENTITY_PREFIXES = (
+    STORAGE_MANAGER_IDENTITY_PREFIX.encode(),
+    METRICS_COLLECTOR_IDENTITY_PREFIX.encode(),
+)
+
 # Cap for every pool; see ZMQSocketPool for what it bounds. Small because it multiplies by
 # peer count, and one socket per peer already avoids the repeated handshake.
 TQ_SOCKET_POOL_SIZE = int(os.environ.get("TQ_SOCKET_POOL_SIZE", 4))
