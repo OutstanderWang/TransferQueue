@@ -1,3 +1,18 @@
+# Copyright 2025 Huawei Technologies Co., Ltd. All Rights Reserved.
+# Copyright 2025 The TransferQueue Team
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """Accept-queue instrumentation for the storage-unit ROUTER socket.
 
 A get request was observed leaving the manager (TCP counted the bytes and the peer
@@ -67,17 +82,20 @@ class AcceptQueueStats:
 
     @property
     def sk_drops_delta(self) -> int:
+        """Connections this socket dropped during the window, 0 until two samples exist."""
         if self.first_sample is None or self.last_sample is None:
             return 0
         return self.last_sample.sk_drops - self.first_sample.sk_drops
 
     @property
     def overflow_delta(self) -> int:
+        """Machine-wide accept-queue overflows during the window, 0 until two samples exist."""
         if self.first_sample is None or self.last_sample is None:
             return 0
         return self.last_sample.listen_overflows - self.first_sample.listen_overflows
 
     def describe(self) -> str:
+        """Return a one-line summary of the window, for the probe's shutdown log."""
         return (
             f"port={self.port} samples={self.samples} backlog={self.backlog} "
             f"peak_recv_q={self.peak_recv_q} peak_util={self.peak_utilization:.1%} "
@@ -173,6 +191,7 @@ class AcceptQueueProbe:
         self._warned = False
 
     def start(self) -> None:
+        """Start the sampling thread; a second call is a no-op."""
         if self._thread is not None:
             return
         self._thread = threading.Thread(target=self._run, name=f"AcceptQueueProbe-{self.owner_id}", daemon=True)
@@ -180,6 +199,7 @@ class AcceptQueueProbe:
         logger.info(f"[{self.owner_id}]: accept-queue probe started on port {self.port} (interval={self.interval_s}s)")
 
     def stop(self) -> None:
+        """Stop the sampling thread and log the window summary."""
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=5)
