@@ -177,9 +177,6 @@ class SimpleStorageUnit:
         zmq_server_info: ZMQ connection information for clients.
     """
 
-    # Requests counted the moment the worker decodes one, independent of whether it completes.
-    # Class-level defaults so a unit built without __init__ (tests drive the worker loop
-    # directly) still counts instead of raising. See the increment site for why they exist.
     _requests_arrived = 0
     _arrivals_by_op: dict[str, int] = {}
     _accept_probe = None
@@ -241,9 +238,6 @@ class SimpleStorageUnit:
 
         # Frontend: ROUTER for receiving client requests
         self.put_get_socket = create_zmq_socket(self.zmq_context, zmq.ROUTER, self._node_ip)
-        # An overflowing accept queue is drained silently (tcp_abort_on_overflow=0), so it
-        # surfaces only as a client stuck in ESTABLISHED waiting for a reply that never
-        # comes. Env-tunable so an A/B run can restore ZMQ's default of 100.
         self.put_get_socket.setsockopt(zmq.BACKLOG, TQ_STORAGE_ZMQ_BACKLOG)
 
         while True:
@@ -386,12 +380,7 @@ class SimpleStorageUnit:
                 started = time.perf_counter()
 
                 try:
-                    # Counted on arrival, unlike op_stats which only advances on completion, so a
-                    # gap between the two isolates requests that arrived and never finished.
                     self._requests_arrived += 1
-                    # Keyed by name, not str() or value: str() renders as
-                    # "ZMQRequestType.GET_DATA" and the value is the short wire token "GET",
-                    # while op_stats below is keyed "GET_DATA". Only name lets the two join.
                     self._arrivals_by_op[operation.name] = self._arrivals_by_op.get(operation.name, 0) + 1
 
                     logger.debug(f"[{self.storage_unit_id}]: worker received operation: {operation}")

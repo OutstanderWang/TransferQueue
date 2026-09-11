@@ -74,21 +74,42 @@ class StorageUnitTimeout(RuntimeError):
 _ARRIVAL_KEY_BY_OPERATION = {"get": "GET_DATA", "put": "PUT_DATA", "clear": "CLEAR_DATA"}
 
 
-def _describe_unit_state(body: dict[str, Any]) -> str:
-    """Summarize a probe response for the failure log."""
+def _describe_unit_state(body: dict[str, Any], operation: str) -> str:
+    """Turn a successful probe into a verdict plus the state it was drawn from.
+
+    The probe answering only shows the unit is serving *now*: a unit that resumed inside the
+    diagnostic window answers it too, having merely finished the original request late. The
+    arrival counter for the failed op is what separates the two, so without it this reports
+    only that the unit recovered rather than asserting where the request went.
+    """
+    arrivals = body.get("arrivals_by_op")
+    op_key = _ARRIVAL_KEY_BY_OPERATION.get(operation)
+    if not isinstance(arrivals, dict) or op_key is None:
+        verdict = "verdict=unit_serving_again (no arrival counters to locate the request)"
+    else:
+        arrived = arrivals.get(op_key)
+        if not isinstance(arrived, int):
+            verdict = f"verdict=unit_serving_again (unit reports no {op_key} arrivals counter)"
+        elif arrived == 0:
+            verdict = f"verdict=request_lost_in_flight (unit decoded no {op_key} request at all)"
+        else:
+            verdict = (
+                f"verdict=arrived_but_unfinished (unit decoded {arrived} {op_key} request(s); "
+                f"the timed-out one reached the worker and did not complete)"
+            )
+
     parts = [
         f"requests_arrived={body.get('requests_arrived')}",
         f"active_keys={body.get('active_keys')}",
         f"rss_gb={body.get('process_rss_bytes', 0) / 2**30:.2f}",
     ]
-    # Only present when the unit runs with Prometheus enabled; an empty dict here would read
-    # as "served nothing" rather than "not measured".
     op_stats = body.get("op_stats") or {}
     if op_stats:
         parts.append(f"completed={ {op: stats.get('request_count') for op, stats in op_stats.items()} }")
     else:
+        # op_stats is populated only with Prometheus; an empty dict would read as "served nothing".
         parts.append("completed=unavailable(prometheus_disabled)")
-    return f"({' '.join(parts)})"
+    return f"{verdict} ({' '.join(parts)})"
 
 
 _SU_SUBDIR = "simple_storage"
@@ -291,31 +312,7 @@ class AsyncSimpleStorageManager(StorageManager):
         except Exception as e:
             return f"{tcp} verdict=unknown (probe failed: {type(e).__name__}: {e})"
 
-        return f"{tcp} {self._verdict_from_counters(body, operation)} {_describe_unit_state(body)}"
-
-    @staticmethod
-    def _verdict_from_counters(body: dict[str, Any], operation: str) -> str:
-        """Decide what a successful probe proves about the request that timed out.
-
-        The probe answering only shows the unit is serving *now*: a unit that resumed inside
-        the diagnostic window answers it too, having merely finished the original request late.
-        The unit's arrival counter is what separates the two, so absent that counter this
-        reports only that the unit recovered rather than asserting where the request went.
-        """
-        arrivals = body.get("arrivals_by_op")
-        op_key = _ARRIVAL_KEY_BY_OPERATION.get(operation)
-        if not isinstance(arrivals, dict) or op_key is None:
-            return "verdict=unit_serving_again (no arrival counters to locate the request)"
-
-        arrived = arrivals.get(op_key)
-        if not isinstance(arrived, int):
-            return f"verdict=unit_serving_again (unit reports no {op_key} arrivals counter)"
-        if arrived == 0:
-            return f"verdict=request_lost_in_flight (unit decoded no {op_key} request at all)"
-        return (
-            f"verdict=arrived_but_unfinished (unit decoded {arrived} {op_key} request(s); "
-            f"the timed-out one reached the worker and did not complete)"
-        )
+        return f"{tcp} {_describe_unit_state(body, operation)}"
 
     async def _request_with_retry(
         self,

@@ -177,7 +177,7 @@ async def test_diagnosis_classifies_the_failure(tcp_result, probe_result, expect
 
 def test_diagnosis_does_not_report_empty_op_stats_as_zero_traffic():
     """op_stats is Prometheus-gated, so an empty dict must not read as 'served nothing'."""
-    described = ssm._describe_unit_state({"requests_arrived": 7, "active_keys": 1})
+    described = ssm._describe_unit_state({"requests_arrived": 7, "active_keys": 1}, "get")
 
     assert "completed=unavailable(prometheus_disabled)" in described
     assert "completed={}" not in described
