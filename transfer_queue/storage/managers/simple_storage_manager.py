@@ -63,8 +63,6 @@ class StorageUnitTimeout(RuntimeError):
     """A storage unit did not answer within the send/recv timeout.
 
     Distinct from an error the unit reported: only a missing answer is worth a new connection.
-    The message must name the unit, its endpoint and the timeout, because it is what the callers
-    of ``put_data`` and ``get_data`` see, and the retry logs rely on it instead of repeating them.
     """
 
 

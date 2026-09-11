@@ -617,9 +617,7 @@ class SimpleStorageUnit:
             "capacity": self.storage_unit_size,
             "active_keys": self.storage_data.active_key_count,
             "process_rss_bytes": process_rss,
-            # Reported next to but separately from op_stats below, which is derived from
-            # completion-time histograms: a gap between the two is a request that arrived and
-            # never finished, which the diagnostic probe cannot otherwise distinguish.
+            # Counted on arrival; op_stats below only advances on completion.
             "requests_arrived": self._requests_arrived,
             "arrivals_by_op": dict(self._arrivals_by_op),
         }
