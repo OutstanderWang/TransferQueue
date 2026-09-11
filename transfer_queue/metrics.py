@@ -186,9 +186,8 @@ class TQMetricsExporter:
         )
 
         # ---- Storage-unit request-loss diagnostics ----
-        # Requests counted as the worker decodes them, so comparing this against
-        # tq_storage_request_ops (which advances only on completion) shows requests that
-        # arrived and did not finish. Neither locates an individual request.
+        # Read against tq_storage_request_ops, which advances only on completion: a gap
+        # between the two is requests arriving and not finishing.
         self.storage_requests_arrived = Gauge(
             "tq_storage_requests_arrived",
             "Requests decoded by the storage unit worker, whether or not they completed",
@@ -227,8 +226,8 @@ class TQMetricsExporter:
             ["storage_unit_id"],
             registry=r,
         )
-        # Split so a dashboard can tell whether raising the backlog would have helped: the
-        # kernel charges sk_drops for several establishment failures, not only a full queue.
+        # Split because sk_drops covers several establishment failures, not only a full
+        # queue; the difference is what says whether a bigger backlog would have helped.
         self.storage_listen_overflows = Gauge(
             "tq_storage_listen_overflows",
             "Namespace-wide accept-queue overflows since the probe started",
@@ -423,8 +422,8 @@ class TQMetricsExporter:
                 for op_type, arrived in (metrics.get("arrivals_by_op") or {}).items():
                     self.storage_arrivals_by_op.labels(storage_unit_id=label, op_type=op_type).set(arrived)
 
-                # Absent unless the unit runs with TQ_ACCEPT_PROBE_INTERVAL set. Drop the series
-                # rather than reporting zero, so a disabled probe is not read as "no drops".
+                # Drop the series rather than report zero when the probe is off, so a
+                # disabled probe is not read as "measured, and no drops".
                 accept_queue = metrics.get("accept_queue")
                 accept_gauges = (
                     (self.storage_accept_queue_backlog, "backlog"),

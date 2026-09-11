@@ -13,33 +13,14 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Accept-queue instrumentation for the storage-unit ROUTER socket.
+"""Accept-queue sampling for the storage-unit ROUTER socket.
 
-A get request was observed leaving the manager (TCP counted the bytes and the peer
-ACKed them) while the unit's worker never saw it: its GET_DATA counter did not move
-and it kept polling. One candidate drop point is the listen socket's accept queue,
-which ZMQ leaves at its default backlog of 100. With the default
-``tcp_abort_on_overflow=0`` an overflowing queue drops the client's final ACK rather
-than sending an RST, so neither end reports an error; the server keeps retransmitting
-its SYN-ACK, and the connection still completes if the queue drains before
-``tcp_synack_retries`` runs out.
-
-This module samples the kernel's own view of that queue so the guess becomes a
-measurement:
-
-* ``Recv-Q`` on a listening socket is the number of established-but-not-yet-accepted
-  connections, i.e. the live queue depth.
-* ``ListenOverflows`` counts accept-queue overflows, and ``ListenDrops`` counts every
-  connection dropped during establishment, overflow or not. Both are per network
-  namespace, so neither attributes an event to one port.
-* ``sk_drops`` is charged to one specific socket, but the kernel increments it on
-  several establishment failures -- a full queue is only one of them -- so a rise
-  locates the socket, not the cause.
-
-Sampling runs in a thread because the queue drains in milliseconds; a value read
-after a hang has already returned to zero, which is exactly what earlier
-post-mortem inspection saw. A zero reading therefore cannot rule out an earlier
-burst, which is why the deltas matter alongside the instantaneous depth.
+A connection dropped while being established is invisible to both ends, so the only
+way to see it is to read the kernel's own counters. Two caveats govern how callers
+may read what this reports: ``ListenOverflows`` and ``ListenDrops`` are per network
+namespace rather than per port, and the kernel charges a socket's ``sk_drops`` for
+several establishment failures, of which a full queue is only one. See
+``docs/metrics.md`` for the exported metrics.
 """
 
 from __future__ import annotations
@@ -48,7 +29,7 @@ import re
 import subprocess
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 
 from transfer_queue.utils.logging_utils import get_logger
 
@@ -86,7 +67,6 @@ class AcceptQueueStats:
     backlog: int = 0
     first_sample: AcceptQueueSample | None = None
     last_sample: AcceptQueueSample | None = None
-    peak_history: list[tuple[float, int]] = field(default_factory=list)
 
     @property
     def sk_drops_delta(self) -> int:
@@ -104,12 +84,7 @@ class AcceptQueueStats:
 
     @property
     def non_overflow_drop_delta(self) -> int:
-        """Namespace-wide establishment drops during the window that were not overflows.
-
-        ListenDrops counts every connection dropped while being established and
-        ListenOverflows only the full-queue ones, so a positive difference is direct
-        evidence that raising the backlog would not have prevented all of them.
-        """
+        """Establishment drops in this window that were not accept-queue overflows."""
         if self.first_sample is None or self.last_sample is None:
             return 0
         drops = self.last_sample.listen_drops - self.first_sample.listen_drops
@@ -189,10 +164,9 @@ class AcceptQueueProbe:
     Args:
         port: Listening port to watch.
         owner_id: Identifier used in log lines (the storage unit id).
-        interval_s: Seconds between samples. Keep well under a second; the queue
-            drains in milliseconds and a slower cadence misses the burst entirely.
-        warn_utilization: Log a warning the first time depth reaches this fraction
-            of the backlog, so a near-miss is visible before any drop happens.
+        interval_s: Seconds between samples. Keep sub-second; the queue drains in
+            milliseconds, so a slower cadence misses the burst entirely.
+        warn_utilization: Warn once when depth first reaches this fraction of the backlog.
     """
 
     def __init__(
@@ -246,11 +220,9 @@ class AcceptQueueProbe:
         if sample.recv_q > stats.peak_recv_q:
             stats.peak_recv_q = sample.recv_q
             stats.peak_utilization = sample.utilization
-            stats.peak_history.append((sample.timestamp, sample.recv_q))
 
-        # sk_drops is a monotonic kernel counter, so this compares against the previous
-        # sample rather than the first: measuring from probe start would keep reporting a
-        # drop that happened once, on every sample, and erase when it actually occurred.
+        # Against the previous sample, not the first: sk_drops is cumulative, so measuring
+        # from probe start would re-report one old drop on every sample.
         if previous is not None and sample.sk_drops > previous.sk_drops:
             logger.error(
                 f"[{self.owner_id}]: listening socket on port {self.port} dropped an incoming "

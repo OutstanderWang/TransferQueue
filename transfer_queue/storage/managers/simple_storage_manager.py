@@ -69,10 +69,8 @@ class StorageUnitTimeout(RuntimeError):
 def _describe_unit_state(body: dict[str, Any]) -> str:
     """Summarize a successful probe: the unit is serving again, plus its own counters.
 
-    Deliberately draws no conclusion about the request that timed out. The counters are
-    cumulative per operation and carry no request identity, so they cannot say whether this
-    request arrived: a nonzero count may be entirely historical, and a zero one only means
-    the unit has not decoded that operation since it last started.
+    Draws no conclusion about the timed-out request: the counters are cumulative per
+    operation and carry no request identity, so no value of them locates one request.
     """
     parts = [
         f"requests_arrived={body.get('requests_arrived')}",
@@ -84,7 +82,7 @@ def _describe_unit_state(body: dict[str, Any]) -> str:
     if op_stats:
         parts.append(f"completed={ {op: stats.get('request_count') for op, stats in op_stats.items()} }")
     else:
-        # op_stats is populated only with Prometheus; an empty dict would read as "served nothing".
+        # Only with Prometheus enabled; an empty dict would read as "served nothing".
         parts.append("completed=unavailable(prometheus_disabled)")
     return f"verdict=unit_serving_again ({' '.join(parts)})"
 
@@ -264,8 +262,7 @@ class AsyncSimpleStorageManager(StorageManager):
         """Report whether the unit is reachable and serving after a request to it timed out.
 
         Returns one log line and never raises: it runs while another failure is being reported.
-        Says nothing about where the timed-out request went; the unit exposes no per-request
-        state that could establish that.
+        Says nothing about where that request went; no per-request state exists to show it.
         """
         info = self.storage_unit_infos.get(target_storage_unit)
         if info is None:

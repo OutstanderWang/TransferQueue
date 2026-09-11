@@ -53,12 +53,10 @@ TQ_NUM_THREADS = int(os.environ.get("TQ_NUM_THREADS", 8))
 # Marks a GET_ERROR reply as "the key is gone" so the caller can tell it apart from a real fault.
 KEY_NOT_FOUND_MARKER = "TQKeyNotFound"
 
-# Accept-queue depth for the client-facing ROUTER, well above ZMQ's default of 100 because a
-# full accept queue is drained without an RST and so loses connections silently.
+# Accept-queue depth for the client-facing ROUTER. A full queue loses connections silently.
 TQ_STORAGE_ZMQ_BACKLOG = int(os.environ.get("TQ_STORAGE_ZMQ_BACKLOG", 4096))
 
-# Sampling period for the accept-queue probe, in seconds. 0 disables it. Sub-second because
-# the queue drains in milliseconds, so a reading taken after a hang is always zero.
+# Accept-queue sampling period in seconds; 0 disables the probe. Keep sub-second.
 TQ_ACCEPT_PROBE_INTERVAL = float(os.environ.get("TQ_ACCEPT_PROBE_INTERVAL", 0))
 
 
@@ -193,8 +191,6 @@ class SimpleStorageUnit:
 
         self.storage_data = StorageUnitData(self.storage_unit_size)
 
-        # Own copies so counts stay per unit; the class-level defaults above only exist for
-        # instances built without __init__.
         self._requests_arrived = 0
         self._arrivals_by_op = {}
 
@@ -250,8 +246,8 @@ class SimpleStorageUnit:
                 continue
 
         if TQ_ACCEPT_PROBE_INTERVAL > 0:
-            # Imported lazily: the probe shells out to ``ss`` on a timer, so a run that has
-            # not asked for it should not even load the module.
+            # Lazy: the probe shells out to ``ss`` on a timer, so keep it out of runs that
+            # have not enabled it.
             from transfer_queue.utils.accept_probe import AcceptQueueProbe
 
             self._accept_probe = AcceptQueueProbe(
@@ -799,8 +795,7 @@ class SimpleStorageUnit:
         # Signal all threads to stop
         shutdown_event.set()
 
-        # Stop before the ZMQ teardown: the probe samples on its own timer and would keep
-        # spawning `ss` after the unit is gone, and stopping it logs the window summary.
+        # Before the ZMQ teardown: the probe runs on its own timer and would outlive the unit.
         if accept_probe is not None:
             accept_probe.stop()
 
