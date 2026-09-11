@@ -17,21 +17,29 @@
 
 A get request was observed leaving the manager (TCP counted the bytes and the peer
 ACKed them) while the unit's worker never saw it: its GET_DATA counter did not move
-and it kept polling. The suspected drop point is the listen socket's accept queue,
-which ZMQ leaves at its default backlog of 100 and which the kernel empties
-silently (``tcp_abort_on_overflow=0``), so neither end raises an error.
+and it kept polling. One candidate drop point is the listen socket's accept queue,
+which ZMQ leaves at its default backlog of 100. With the default
+``tcp_abort_on_overflow=0`` an overflowing queue drops the client's final ACK rather
+than sending an RST, so neither end reports an error; the server keeps retransmitting
+its SYN-ACK, and the connection still completes if the queue drains before
+``tcp_synack_retries`` runs out.
 
 This module samples the kernel's own view of that queue so the guess becomes a
 measurement:
 
 * ``Recv-Q`` on a listening socket is the number of established-but-not-yet-accepted
   connections, i.e. the live queue depth.
-* ``ListenOverflows`` / ``ListenDrops`` count queue-full events machine-wide.
-* ``sk_drops`` counts drops charged to one specific socket.
+* ``ListenOverflows`` counts accept-queue overflows, and ``ListenDrops`` counts every
+  connection dropped during establishment, overflow or not. Both are per network
+  namespace, so neither attributes an event to one port.
+* ``sk_drops`` is charged to one specific socket, but the kernel increments it on
+  several establishment failures -- a full queue is only one of them -- so a rise
+  locates the socket, not the cause.
 
 Sampling runs in a thread because the queue drains in milliseconds; a value read
 after a hang has already returned to zero, which is exactly what earlier
-post-mortem inspection saw.
+post-mortem inspection saw. A zero reading therefore cannot rule out an earlier
+burst, which is why the deltas matter alongside the instantaneous depth.
 """
 
 from __future__ import annotations
@@ -89,10 +97,23 @@ class AcceptQueueStats:
 
     @property
     def overflow_delta(self) -> int:
-        """Machine-wide accept-queue overflows during the window, 0 until two samples exist."""
+        """Namespace-wide accept-queue overflows during the window, 0 until two samples exist."""
         if self.first_sample is None or self.last_sample is None:
             return 0
         return self.last_sample.listen_overflows - self.first_sample.listen_overflows
+
+    @property
+    def non_overflow_drop_delta(self) -> int:
+        """Namespace-wide establishment drops during the window that were not overflows.
+
+        ListenDrops counts every connection dropped while being established and
+        ListenOverflows only the full-queue ones, so a positive difference is direct
+        evidence that raising the backlog would not have prevented all of them.
+        """
+        if self.first_sample is None or self.last_sample is None:
+            return 0
+        drops = self.last_sample.listen_drops - self.first_sample.listen_drops
+        return drops - self.overflow_delta
 
     def describe(self) -> str:
         """Return a one-line summary of the window, for the probe's shutdown log."""
@@ -123,7 +144,7 @@ def _read_listen_socket(port: int) -> tuple[int, int, int] | None:
 
 
 def _read_listen_overflows() -> tuple[int, int]:
-    """Return machine-wide (ListenOverflows, ListenDrops) from /proc/net/netstat."""
+    """Return this namespace's (ListenOverflows, ListenDrops) from /proc/net/netstat."""
     try:
         with open("/proc/net/netstat") as handle:
             lines = handle.read().splitlines()
@@ -232,12 +253,15 @@ class AcceptQueueProbe:
         # drop that happened once, on every sample, and erase when it actually occurred.
         if previous is not None and sample.sk_drops > previous.sk_drops:
             logger.error(
-                f"[{self.owner_id}]: accept queue dropped a connection on port {self.port}. "
-                f"recv_q={sample.recv_q}/{sample.backlog} sk_drops={sample.sk_drops} "
+                f"[{self.owner_id}]: listening socket on port {self.port} dropped an incoming "
+                f"connection. recv_q={sample.recv_q}/{sample.backlog} sk_drops={sample.sk_drops} "
                 f"(+{sample.sk_drops - previous.sk_drops} since the last sample, "
-                f"+{stats.sk_drops_delta} since probe start). "
-                f"A silently dropped connection leaves the client in ESTABLISHED with no "
-                f"reply; raise ZMQ_BACKLOG above {sample.backlog}."
+                f"+{stats.sk_drops_delta} since probe start); netns since probe start: "
+                f"listen_overflows +{stats.overflow_delta}, other establishment drops "
+                f"+{stats.non_overflow_drop_delta}. The kernel charges sk_drops for several "
+                f"establishment failures, so a full queue is only one candidate: raising "
+                f"ZMQ_BACKLOG above {sample.backlog} helps only if recv_q above and the "
+                f"overflow delta point that way."
             )
 
         if not self._warned and sample.utilization >= self.warn_utilization:

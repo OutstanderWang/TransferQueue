@@ -68,38 +68,17 @@ class StorageUnitTimeout(RuntimeError):
     """
 
 
-# Maps the operation name used by the retry path to the storage unit's arrival counter key.
-# Explicit rather than derived: the counters are keyed by ZMQRequestType.name ("GET_DATA"),
-# while the enum's value is the short wire token "GET", so "get".upper() would miss.
-_ARRIVAL_KEY_BY_OPERATION = {"get": "GET_DATA", "put": "PUT_DATA", "clear": "CLEAR_DATA"}
+def _describe_unit_state(body: dict[str, Any]) -> str:
+    """Summarize a successful probe: the unit is serving again, plus its own counters.
 
-
-def _describe_unit_state(body: dict[str, Any], operation: str) -> str:
-    """Turn a successful probe into a verdict plus the state it was drawn from.
-
-    The probe answering only shows the unit is serving *now*: a unit that resumed inside the
-    diagnostic window answers it too, having merely finished the original request late. The
-    arrival counter for the failed op is what separates the two, so without it this reports
-    only that the unit recovered rather than asserting where the request went.
+    Deliberately draws no conclusion about the request that timed out. The counters are
+    cumulative per operation and carry no request identity, so they cannot say whether this
+    request arrived: a nonzero count may be entirely historical, and a zero one only means
+    the unit has not decoded that operation since it last started.
     """
-    arrivals = body.get("arrivals_by_op")
-    op_key = _ARRIVAL_KEY_BY_OPERATION.get(operation)
-    if not isinstance(arrivals, dict) or op_key is None:
-        verdict = "verdict=unit_serving_again (no arrival counters to locate the request)"
-    else:
-        arrived = arrivals.get(op_key)
-        if not isinstance(arrived, int):
-            verdict = f"verdict=unit_serving_again (unit reports no {op_key} arrivals counter)"
-        elif arrived == 0:
-            verdict = f"verdict=request_lost_in_flight (unit decoded no {op_key} request at all)"
-        else:
-            verdict = (
-                f"verdict=arrived_but_unfinished (unit decoded {arrived} {op_key} request(s); "
-                f"the timed-out one reached the worker and did not complete)"
-            )
-
     parts = [
         f"requests_arrived={body.get('requests_arrived')}",
+        f"arrivals_by_op={body.get('arrivals_by_op')}",
         f"active_keys={body.get('active_keys')}",
         f"rss_gb={body.get('process_rss_bytes', 0) / 2**30:.2f}",
     ]
@@ -109,7 +88,7 @@ def _describe_unit_state(body: dict[str, Any], operation: str) -> str:
     else:
         # op_stats is populated only with Prometheus; an empty dict would read as "served nothing".
         parts.append("completed=unavailable(prometheus_disabled)")
-    return f"{verdict} ({' '.join(parts)})"
+    return f"verdict=unit_serving_again ({' '.join(parts)})"
 
 
 _SU_SUBDIR = "simple_storage"
@@ -283,14 +262,12 @@ class AsyncSimpleStorageManager(StorageManager):
             raise RuntimeError(f"unexpected probe response type {response_msg.request_type}")
         return response_msg.body
 
-    async def _diagnose_storage_unit(self, target_storage_unit: str, operation: str = "") -> str:
-        """Classify a timeout using the unit's own arrival counters.
+    async def _diagnose_storage_unit(self, target_storage_unit: str) -> str:
+        """Report whether the unit is reachable and serving after a request to it timed out.
 
         Returns one log line and never raises: it runs while another failure is being reported.
-
-        Args:
-            target_storage_unit (str): Unit that failed to answer.
-            operation (str): Failed operation as passed to ``_request_with_retry``, e.g. ``get``.
+        Says nothing about where the timed-out request went; the unit exposes no per-request
+        state that could establish that.
         """
         info = self.storage_unit_infos.get(target_storage_unit)
         if info is None:
@@ -312,7 +289,7 @@ class AsyncSimpleStorageManager(StorageManager):
         except Exception as e:
             return f"{tcp} verdict=unknown (probe failed: {type(e).__name__}: {e})"
 
-        return f"{tcp} {_describe_unit_state(body, operation)}"
+        return f"{tcp} {_describe_unit_state(body)}"
 
     async def _request_with_retry(
         self,
@@ -350,7 +327,7 @@ class AsyncSimpleStorageManager(StorageManager):
                     continue
                 logger.error(
                     f"[{self.storage_manager_id}]: {operation} failed after {attempt} attempts. "
-                    f"{request_context} {e} {await self._diagnose_storage_unit(target_storage_unit, operation)}"
+                    f"{request_context} {e} {await self._diagnose_storage_unit(target_storage_unit)}"
                 )
                 raise
 

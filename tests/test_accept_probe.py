@@ -15,10 +15,10 @@
 
 """Tests for the accept-queue probe.
 
-A silently dropped connection leaves the client in ESTABLISHED with no reply and the
-unit's worker idle, which is what post-mortem inspection of a hang actually showed.
-The probe turns that guess into a measurement, so these tests pin the arithmetic it
-reports and the levels it logs at.
+A connection dropped during establishment is invisible to both ends, and the kernel
+charges the listening socket's sk_drops on several such paths, of which a full accept
+queue is only one. These tests pin the arithmetic the probe reports, the levels it logs
+at, and that it never names a cause its counters cannot establish.
 """
 
 import threading
@@ -32,14 +32,16 @@ from transfer_queue.utils.accept_probe import (
 )
 
 
-def _sample(recv_q: int, backlog: int = 100, sk_drops: int = 0, overflows: int = 0) -> AcceptQueueSample:
+def _sample(
+    recv_q: int, backlog: int = 100, sk_drops: int = 0, overflows: int = 0, drops: int | None = None
+) -> AcceptQueueSample:
     return AcceptQueueSample(
         timestamp=0.0,
         recv_q=recv_q,
         backlog=backlog,
         sk_drops=sk_drops,
         listen_overflows=overflows,
-        listen_drops=overflows,
+        listen_drops=overflows if drops is None else drops,
     )
 
 
@@ -118,7 +120,7 @@ def test_drop_increase_is_logged_at_error(caplog):
     with caplog.at_level("ERROR"):
         probe._record(_sample(100, sk_drops=24))
 
-    assert "accept queue dropped a connection" in caplog.text
+    assert "dropped an incoming connection" in caplog.text
 
 
 def test_steady_drop_count_is_logged_once_not_every_sample(caplog):
@@ -136,7 +138,7 @@ def test_steady_drop_count_is_logged_once_not_every_sample(caplog):
         for _ in range(20):
             probe._record(_sample(0, sk_drops=13))  # unchanged -- stay quiet
 
-    assert caplog.text.count("accept queue dropped a connection") == 1
+    assert caplog.text.count("dropped an incoming connection") == 1
 
 
 def test_each_new_drop_is_reported(caplog):
@@ -149,7 +151,7 @@ def test_each_new_drop_is_reported(caplog):
         probe._record(_sample(0, sk_drops=13))
         probe._record(_sample(0, sk_drops=14))
 
-    assert caplog.text.count("accept queue dropped a connection") == 2
+    assert caplog.text.count("dropped an incoming connection") == 2
 
 
 def test_near_full_queue_warns_once(caplog):
@@ -217,3 +219,39 @@ def test_shutdown_without_a_probe_is_a_no_op():
         zmq_context=None,
         put_get_socket=None,
     )
+
+
+def test_non_overflow_drops_are_separated_from_overflows():
+    """ListenDrops counts every establishment failure; only some are queue overflows.
+
+    The kernel charges a listening socket's sk_drops on several paths -- a full accept
+    queue, but also failures to allocate or route the new connection -- so this difference
+    is what says whether a bigger backlog could have helped.
+    """
+    stats = AcceptQueueStats(port=1234)
+    stats.first_sample = _sample(0, overflows=10, drops=20)
+    stats.last_sample = _sample(0, overflows=11, drops=25)
+
+    assert stats.overflow_delta == 1
+    assert stats.non_overflow_drop_delta == 4
+
+
+def test_pure_overflow_window_reports_no_other_drops():
+    stats = AcceptQueueStats(port=1234)
+    stats.first_sample = _sample(0, overflows=10, drops=10)
+    stats.last_sample = _sample(0, overflows=13, drops=13)
+
+    assert stats.overflow_delta == 3
+    assert stats.non_overflow_drop_delta == 0
+
+
+def test_drop_alert_does_not_assert_the_queue_overflowed(caplog):
+    """sk_drops locates the socket, not the cause, so the alert must not name one."""
+    probe = _probe()
+    probe._record(_sample(0, sk_drops=1))
+
+    with caplog.at_level("ERROR"):
+        probe._record(_sample(0, sk_drops=2))
+
+    assert "dropped an incoming connection" in caplog.text
+    assert "accept queue dropped" not in caplog.text

@@ -632,6 +632,7 @@ class SimpleStorageUnit:
                 "peak_utilization": stats.peak_utilization,
                 "sk_drops_delta": stats.sk_drops_delta,
                 "listen_overflow_delta": stats.overflow_delta,
+                "non_overflow_drop_delta": stats.non_overflow_drop_delta,
                 "samples": stats.samples,
             }
 
