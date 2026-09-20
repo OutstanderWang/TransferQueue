@@ -18,11 +18,12 @@ import pickle
 import time
 import weakref
 from threading import Event, Thread
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Callable
 from uuid import uuid4
 
 import psutil
 import ray
+import torch
 import zmq
 
 from transfer_queue.utils.common import limit_pytorch_auto_parallel_threads, log_heavy_operation
@@ -58,6 +59,18 @@ TQ_STORAGE_ZMQ_BACKLOG = int(os.environ.get("TQ_STORAGE_ZMQ_BACKLOG", 4096))
 
 # Accept-queue sampling period in seconds; 0 disables the probe. Keep sub-second.
 TQ_ACCEPT_PROBE_INTERVAL = float(os.environ.get("TQ_ACCEPT_PROBE_INTERVAL", 0))
+
+
+def _describe_stored_values(values: list) -> dict[str, Any]:
+    """Describe per-sample stored values for the manager.
+
+    A unit only holds part of a batch, so it reports one shape per sample and
+    leaves ``shapes=None`` for a column it cannot describe as tensors; only the
+    manager sees the whole batch and can turn this into a field_schema.
+    """
+    if not all(isinstance(v, torch.Tensor) for v in values):
+        return {"dtype": None, "shapes": None}
+    return {"dtype": values[0].dtype, "shapes": [tuple(v.shape) for v in values]}
 
 
 class StorageKeyNotFoundError(KeyError):
@@ -144,6 +157,36 @@ class StorageUnitData:
             for key, val in zip(global_indexes, values, strict=True):
                 field_dict[key] = val
         self._active_keys.update(global_indexes)
+
+    def apply_update(
+        self,
+        global_indexes: list[int],
+        fields: list[str],
+        new_data: dict[str, Any] | None,
+        parser: Callable[[Any, Any], Any] | None,
+        use_empty: bool,
+    ) -> dict[str, dict[str, Any]]:
+        """Read each (field, index), compute the stored value, then write once.
+
+        Missing fields yield ``old=None``. All parser calls finish before any write,
+        so a raise leaves storage unchanged.
+
+        Returns:
+            Per-sample description of the stored values, keyed by field name.
+        """
+        computed: dict[str, list] = {}
+        if use_empty:
+            computed = {field: [None] * len(global_indexes) for field in fields}
+        else:
+            if parser is None or new_data is None:
+                raise TypeError("apply_update requires a parser and new values unless use_empty is set")
+            for field in fields:
+                old_values = self.field_data.get(field, {})
+                computed[field] = [
+                    parser(old_values.get(idx), new_data[field][i]) for i, idx in enumerate(global_indexes)
+                ]
+        self.put_data(computed, global_indexes)
+        return {field: _describe_stored_values(values) for field, values in computed.items()}
 
     def clear(self, keys: list[int]) -> None:
         """Remove data at given global index keys, immediately freeing memory.
@@ -385,6 +428,9 @@ class SimpleStorageUnit:
                     if operation == ZMQRequestType.PUT_DATA:  # type: ignore[arg-type]
                         with monitor.measure(op_type="PUT_DATA"):
                             response_msg = self._handle_put(request_msg)
+                    elif operation == ZMQRequestType.UPDATE_DATA:  # type: ignore[arg-type]
+                        with monitor.measure(op_type="UPDATE_DATA"):
+                            response_msg = self._handle_update(request_msg)
                     elif operation == ZMQRequestType.GET_DATA:  # type: ignore[arg-type]
                         with monitor.measure(op_type="GET_DATA"):
                             response_msg = self._handle_get(request_msg)
@@ -518,6 +564,40 @@ class SimpleStorageUnit:
                 },
             )
 
+    def _handle_update(self, data_parts: ZMQMessage) -> ZMQMessage:
+        """Read each field, apply empty or parser(old, new), write once, describe what was stored."""
+        try:
+            global_indexes = data_parts.body["global_indexes"]
+            fields = data_parts.body["fields"]
+            use_empty = bool(data_parts.body.get("empty", False))
+            parser = data_parts.body.get("parser")
+            new_data = data_parts.body.get("data")
+
+            with limit_pytorch_auto_parallel_threads(
+                target_num_threads=TQ_NUM_THREADS, info=f"[{self.storage_unit_id}] _handle_update"
+            ):
+                if not use_empty:
+                    if not callable(parser):
+                        raise TypeError(f"update parser must be callable, got {type(parser).__name__}")
+                    if not isinstance(new_data, dict):
+                        raise TypeError("update data must be a dict of new field values")
+                stored_shapes = self.storage_data.apply_update(global_indexes, fields, new_data, parser, use_empty)
+
+            return ZMQMessage.create(
+                request_type=ZMQRequestType.UPDATE_DATA_RESPONSE,  # type: ignore[arg-type]
+                sender_id=self.storage_unit_id,
+                body={"stored_shapes": stored_shapes},
+            )
+        except Exception as e:
+            return ZMQMessage.create(
+                request_type=ZMQRequestType.UPDATE_ERROR,  # type: ignore[arg-type]
+                sender_id=self.storage_unit_id,
+                body={
+                    "message": f"Failed to update data in storage unit id "
+                    f"#{self.storage_unit_id}, detail error message: {str(e)}"
+                },
+            )
+
     def _handle_get(self, data_parts: ZMQMessage) -> ZMQMessage:
         """
         Handle get request, return data from storage unit.
@@ -633,7 +713,7 @@ class SimpleStorageUnit:
         # Include per-operation stats if Prometheus metrics are enabled
         if self._metrics is not None:
             op_stats = {}
-            for op_type in ("PUT_DATA", "GET_DATA", "CLEAR_DATA"):
+            for op_type in ("PUT_DATA", "UPDATE_DATA", "GET_DATA", "CLEAR_DATA"):
                 try:
                     hist = self._metrics.request_duration.labels(op_type=op_type)
                     counter = self._metrics.request_total.labels(op_type=op_type)
