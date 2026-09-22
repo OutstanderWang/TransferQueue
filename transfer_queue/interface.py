@@ -1068,22 +1068,16 @@ def get_client():
 
 _METADATA_FILE = "metadata.json"
 _CONTROLLER_FILE = "controller_state.pkl"
+_MANIFEST_FILE = "selection_manifest.json"
 
 
 def save_checkpoint(
     checkpoint_dir: str | Path,
     *,
-    keys: Sequence[str] | None = None,
-    partition_id: str | None = None,
     include_storage: bool = True,
     metadata: dict[str, Any] | None = None,
 ) -> None:
-    """Save a checkpoint of the TransferQueue system state.
-
-    When ``keys`` and ``partition_id`` are provided, only those key-addressed
-    rows are serialized.  The selected rows retain their original global
-    indexes, field schema, tags, and production/consumption state.  Passing
-    ``keys=None`` preserves the full-checkpoint behavior.
+    """Save a full checkpoint of the TransferQueue system state.
 
     .. note::
         **Multi-node limitation**: checkpoint_dir must reside on a shared network
@@ -1092,11 +1086,6 @@ def save_checkpoint(
 
     Args:
         checkpoint_dir: Directory to save the checkpoint (created if not exists).
-        keys: Optional keys to save from ``partition_id``. Duplicate keys are
-              removed while preserving their first-seen order. A missing key
-              raises ``KeyError``.
-        partition_id: Partition containing ``keys``. Must be provided together
-                      with ``keys``.
         include_storage: Whether to save storage backend state. Set to False to
                          save controller metadata only (e.g. for KV backends where
                          data persists externally and does not need to be re-saved).
@@ -1113,12 +1102,6 @@ def save_checkpoint(
     if _TQ_CONTROLLER is None:
         raise RuntimeError("TransferQueue is not initialized. Call tq.init() first.")
 
-    if (keys is None) != (partition_id is None):
-        raise ValueError("keys and partition_id must be provided together")
-    if isinstance(keys, str):
-        keys = [keys]
-    selection = None if keys is None else {partition_id: list(dict.fromkeys(keys))}
-
     checkpoint_dir = Path(checkpoint_dir)
     tmp_dir = checkpoint_dir.parent / (checkpoint_dir.name + ".tmp")
 
@@ -1130,12 +1113,7 @@ def save_checkpoint(
         client = _maybe_create_tq_client()
 
         controller_path = tmp_dir / _CONTROLLER_FILE
-        selection_manifest_path = tmp_dir / "selection_manifest.json" if selection is not None else None
-        produced_global_indexes = client.save_controller_checkpoint(
-            str(controller_path),
-            selection=selection,
-            manifest_path=str(selection_manifest_path) if selection_manifest_path else None,
-        )
+        client.save_controller_checkpoint(str(controller_path))
         logger.info("Controller state saved.")
 
         if not include_storage and isinstance(client.storage_manager, AsyncSimpleStorageManager):
@@ -1147,10 +1125,7 @@ def save_checkpoint(
 
         if include_storage:
             try:
-                if produced_global_indexes is None:
-                    client.save_storage_checkpoint(str(tmp_dir))
-                else:
-                    client.save_storage_checkpoint(str(tmp_dir), global_indexes=produced_global_indexes)
+                client.save_storage_checkpoint(str(tmp_dir))
             except NotImplementedError:
                 logger.warning("Storage backend does not support checkpoint; storage data will not be saved.")
                 include_storage = False
@@ -1159,13 +1134,6 @@ def save_checkpoint(
             "storage_saved": include_storage,
             "user_metadata": metadata or {},
         }
-        if selection is not None:
-            meta_content["selection"] = {
-                "partition_id": partition_id,
-                "num_keys": len(selection[partition_id]),
-                "num_produced_rows": len(produced_global_indexes or []),
-                "storage_unit_count": len(getattr(client.storage_manager, "storage_unit_infos", {})),
-            }
         with open(tmp_dir / _METADATA_FILE, "w") as f:
             json.dump(meta_content, f, indent=2)
 
@@ -1174,6 +1142,93 @@ def save_checkpoint(
         tmp_dir.rename(checkpoint_dir)
 
         logger.info(f"Checkpoint saved to {checkpoint_dir}")
+
+    except Exception:
+        if tmp_dir.exists():
+            shutil.rmtree(tmp_dir)
+        raise
+
+
+def save_checkpoint_by_key(
+    checkpoint_dir: str | Path,
+    keys: str | Sequence[str],
+    partition_id: str,
+    *,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    """Save a checkpoint holding only the given keys of one partition.
+
+    The selected rows keep their original global indexes, field schema, tags, and
+    production/consumption state, so the result is a smaller checkpoint in the same
+    format ``load_checkpoint`` already reads. Every other partition is omitted, and
+    the indexes left out become reusable on restore.
+
+    Storage is always saved: a selective checkpoint that carried metadata but no
+    payload would restore rows whose data cannot be read back.
+
+    .. note::
+        **Multi-node limitation**: checkpoint_dir must reside on a shared network
+        filesystem (e.g. NFS, GPFS, Lustre) accessible from all nodes.
+        Single-node deployments have no such requirement.
+
+    Args:
+        checkpoint_dir: Directory to save the checkpoint (created if not exists).
+        keys: Key or keys to save. Duplicates are dropped, first occurrence wins.
+        partition_id: Partition that owns ``keys``.
+        metadata: User-defined key-value pairs written into metadata.json.
+
+    Raises:
+        RuntimeError: TransferQueue is not initialized, or a key or the partition
+            does not exist.
+        ValueError: ``keys`` is empty.
+        OSError: Failed to write checkpoint files.
+    """
+    if _TQ_CONTROLLER is None:
+        raise RuntimeError("TransferQueue is not initialized. Call tq.init() first.")
+
+    if isinstance(keys, str):
+        keys = [keys]
+    unique_keys = list(dict.fromkeys(keys))
+    if not unique_keys:
+        raise ValueError("keys must not be empty; call save_checkpoint() to save everything")
+
+    checkpoint_dir = Path(checkpoint_dir)
+    tmp_dir = checkpoint_dir.parent / (checkpoint_dir.name + ".tmp")
+
+    if tmp_dir.exists():
+        shutil.rmtree(tmp_dir)
+    tmp_dir.mkdir(parents=True)
+
+    try:
+        client = _maybe_create_tq_client()
+
+        produced_global_indexes = client.save_controller_checkpoint_by_key(
+            str(tmp_dir / _CONTROLLER_FILE),
+            partition_id,
+            unique_keys,
+            str(tmp_dir / _MANIFEST_FILE),
+        )
+        logger.info(f"Controller state saved for {len(unique_keys)} keys of partition {partition_id}.")
+
+        client.save_storage_checkpoint_by_index(str(tmp_dir), produced_global_indexes)
+
+        meta_content = {
+            "storage_saved": True,
+            "user_metadata": metadata or {},
+            "selection": {
+                "partition_id": partition_id,
+                "num_keys": len(unique_keys),
+                "num_produced_rows": len(produced_global_indexes),
+            },
+        }
+        with open(tmp_dir / _METADATA_FILE, "w") as f:
+            json.dump(meta_content, f, indent=2)
+
+        if checkpoint_dir.exists():
+            shutil.rmtree(checkpoint_dir)
+        tmp_dir.rename(checkpoint_dir)
+
+        logger.info(f"Selective checkpoint saved to {checkpoint_dir}")
 
     except Exception:
         if tmp_dir.exists():

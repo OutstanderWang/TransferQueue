@@ -361,7 +361,7 @@ class StorageManager(ABC):
         """
         raise NotImplementedError("Subclasses must implement clear_data")
 
-    async def save_checkpoint(self, checkpoint_dir: str, *, global_indexes: list[int] | None = None) -> None:
+    async def save_checkpoint(self, checkpoint_dir: str) -> None:
         """Save storage state into checkpoint_dir.
 
         The implementation is backend-specific: each backend decides what to
@@ -371,6 +371,18 @@ class StorageManager(ABC):
             NotImplementedError: If this storage backend does not support checkpoint.
         """
         raise NotImplementedError(f"{self.__class__.__name__} does not support checkpoint")
+
+    async def save_checkpoint_by_index(self, checkpoint_dir: str, global_indexes: list[int]) -> None:
+        """Save only the given rows into checkpoint_dir.
+
+        Args:
+            checkpoint_dir: Directory under which storage unit files are written.
+            global_indexes: Global indexes to serialize.
+
+        Raises:
+            NotImplementedError: If this storage backend does not support selective checkpoint.
+        """
+        raise NotImplementedError(f"{self.__class__.__name__} does not support selective checkpoint")
 
     async def load_checkpoint(self, checkpoint_dir: str) -> None:
         """Restore storage state from checkpoint_dir.

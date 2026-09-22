@@ -36,6 +36,7 @@ from .interface import (
     kv_put,
     load_checkpoint,
     save_checkpoint,
+    save_checkpoint_by_key,
 )
 from .metadata import BatchMeta, KVBatchMeta
 from .sampler import BaseSampler
@@ -67,6 +68,7 @@ __all__ = (
     + [
         # Checkpoint Interface
         "save_checkpoint",
+        "save_checkpoint_by_key",
         "load_checkpoint",
     ]
     + [
