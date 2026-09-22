@@ -712,6 +712,7 @@ class AsyncSimpleStorageManager(StorageManager):
         self,
         path: str,
         target_storage_unit: str,
+        global_indexes: list[int] | None = None,
         socket: zmq.Socket = None,
     ):
         try:
@@ -719,7 +720,7 @@ class AsyncSimpleStorageManager(StorageManager):
                 request_type=ZMQRequestType.SAVE_STORAGE_CHECKPOINT,  # type: ignore[arg-type]
                 sender_id=self.storage_manager_id,
                 receiver_id=target_storage_unit,
-                body={"path": path},
+                body={"path": path, "global_indexes": global_indexes},
             )
             await socket.send_multipart(request_msg.serialize(), copy=False)
             messages = await socket.recv_multipart(copy=False)
@@ -732,6 +733,12 @@ class AsyncSimpleStorageManager(StorageManager):
                     f"Storage unit {target_storage_unit} failed to save checkpoint to {path}: "
                     f"{response_msg.body.get('message', 'unknown error')}"
                 )
+            if global_indexes is not None:
+                missing_rows = response_msg.body.get("missing_rows", [])
+                if missing_rows:
+                    raise RuntimeError(
+                        f"Storage unit {target_storage_unit} could not save requested rows: {missing_rows[:20]}"
+                    )
         except Exception as e:
             raise RuntimeError(
                 f"[{self.storage_manager_id}]: Error dumping storage unit {target_storage_unit}: {str(e)}"
@@ -767,7 +774,7 @@ class AsyncSimpleStorageManager(StorageManager):
                 f"[{self.storage_manager_id}]: Error restoring for storage unit {target_storage_unit}: {str(e)}"
             ) from e
 
-    async def save_checkpoint(self, checkpoint_dir: str) -> None:
+    async def save_checkpoint(self, checkpoint_dir: str, *, global_indexes: list[int] | None = None) -> None:
         """Dump all storage units to the storage_units/ subdirectory of checkpoint_dir.
 
         Writes a storage_units/su_info.json manifest for load_checkpoint to use.
@@ -780,13 +787,30 @@ class AsyncSimpleStorageManager(StorageManager):
 
         su_ids = list(self.storage_unit_infos.keys())
         paths = [str(su_dir / f"su_{pos}_{su_id}.pkl") for pos, su_id in enumerate(su_ids)]
+        if global_indexes is None:
+            indexes_by_su = {su_id: None for su_id in su_ids}
+        else:
+            routing = self._group_by_hash(global_indexes)
+            indexes_by_su = {su_id: (routing[su_id].global_indexes if su_id in routing else []) for su_id in su_ids}
         tasks = [
-            self._save_single_storage_unit(path, target_storage_unit=su_id)
+            self._save_single_storage_unit(
+                path,
+                target_storage_unit=su_id,
+                global_indexes=indexes_by_su[su_id],
+            )
             for su_id, path in zip(su_ids, paths, strict=False)
         ]
         await asyncio.gather(*tasks)
 
-        su_info_list = [{"position": pos, "storage_unit_id": su_id} for pos, su_id in enumerate(su_ids)]
+        su_info_list = [
+            {
+                "position": pos,
+                "storage_unit_id": su_id,
+                "saved_rows": None if global_indexes is None else len(indexes_by_su[su_id]),
+                "selective": global_indexes is not None,
+            }
+            for pos, su_id in enumerate(su_ids)
+        ]
         with open(su_dir / _SU_INFO_FILE, "w") as f:
             json.dump(su_info_list, f)
 

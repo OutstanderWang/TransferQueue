@@ -20,7 +20,7 @@ import subprocess
 import time
 from importlib import resources
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Sequence
 
 import ray
 import torch
@@ -1073,10 +1073,17 @@ _CONTROLLER_FILE = "controller_state.pkl"
 def save_checkpoint(
     checkpoint_dir: str | Path,
     *,
+    keys: Sequence[str] | None = None,
+    partition_id: str | None = None,
     include_storage: bool = True,
     metadata: dict[str, Any] | None = None,
 ) -> None:
-    """Save a full checkpoint of the TransferQueue system state.
+    """Save a checkpoint of the TransferQueue system state.
+
+    When ``keys`` and ``partition_id`` are provided, only those key-addressed
+    rows are serialized.  The selected rows retain their original global
+    indexes, field schema, tags, and production/consumption state.  Passing
+    ``keys=None`` preserves the full-checkpoint behavior.
 
     .. note::
         **Multi-node limitation**: checkpoint_dir must reside on a shared network
@@ -1085,6 +1092,11 @@ def save_checkpoint(
 
     Args:
         checkpoint_dir: Directory to save the checkpoint (created if not exists).
+        keys: Optional keys to save from ``partition_id``. Duplicate keys are
+              removed while preserving their first-seen order. A missing key
+              raises ``KeyError``.
+        partition_id: Partition containing ``keys``. Must be provided together
+                      with ``keys``.
         include_storage: Whether to save storage backend state. Set to False to
                          save controller metadata only (e.g. for KV backends where
                          data persists externally and does not need to be re-saved).
@@ -1101,6 +1113,12 @@ def save_checkpoint(
     if _TQ_CONTROLLER is None:
         raise RuntimeError("TransferQueue is not initialized. Call tq.init() first.")
 
+    if (keys is None) != (partition_id is None):
+        raise ValueError("keys and partition_id must be provided together")
+    if isinstance(keys, str):
+        keys = [keys]
+    selection = None if keys is None else {partition_id: list(dict.fromkeys(keys))}
+
     checkpoint_dir = Path(checkpoint_dir)
     tmp_dir = checkpoint_dir.parent / (checkpoint_dir.name + ".tmp")
 
@@ -1112,7 +1130,12 @@ def save_checkpoint(
         client = _maybe_create_tq_client()
 
         controller_path = tmp_dir / _CONTROLLER_FILE
-        client.save_controller_checkpoint(str(controller_path))
+        selection_manifest_path = tmp_dir / "selection_manifest.json" if selection is not None else None
+        produced_global_indexes = client.save_controller_checkpoint(
+            str(controller_path),
+            selection=selection,
+            manifest_path=str(selection_manifest_path) if selection_manifest_path else None,
+        )
         logger.info("Controller state saved.")
 
         if not include_storage and isinstance(client.storage_manager, AsyncSimpleStorageManager):
@@ -1124,7 +1147,10 @@ def save_checkpoint(
 
         if include_storage:
             try:
-                client.save_storage_checkpoint(str(tmp_dir))
+                if produced_global_indexes is None:
+                    client.save_storage_checkpoint(str(tmp_dir))
+                else:
+                    client.save_storage_checkpoint(str(tmp_dir), global_indexes=produced_global_indexes)
             except NotImplementedError:
                 logger.warning("Storage backend does not support checkpoint; storage data will not be saved.")
                 include_storage = False
@@ -1133,6 +1159,13 @@ def save_checkpoint(
             "storage_saved": include_storage,
             "user_metadata": metadata or {},
         }
+        if selection is not None:
+            meta_content["selection"] = {
+                "partition_id": partition_id,
+                "num_keys": len(selection[partition_id]),
+                "num_produced_rows": len(produced_global_indexes or []),
+                "storage_unit_count": len(getattr(client.storage_manager, "storage_unit_infos", {})),
+            }
         with open(tmp_dir / _METADATA_FILE, "w") as f:
             json.dump(meta_content, f, indent=2)
 

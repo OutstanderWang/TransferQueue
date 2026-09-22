@@ -14,6 +14,7 @@
 # limitations under the License.
 
 import copy
+import json
 import os
 import pickle
 import time
@@ -887,38 +888,40 @@ class DataPartitionStatus:
             setattr(snapshot, name, new_val)
         return snapshot
 
+    def _drop_indexes(self, indexes_to_release: list[int], clear_consumption: bool = True):
+        """Remove rows from a partition without swallowing consistency errors."""
+        if self.production_status is not None:
+            self.production_status[indexes_to_release, :] = 0
+
+        if clear_consumption:
+            for consumption_tensor in self.consumption_status.values():
+                consumption_tensor[indexes_to_release] = 0
+
+        self.global_indexes.difference_update(indexes_to_release)
+        self.pre_allocated_global_indexes.difference_update(indexes_to_release)
+
+        empty_fields = []
+        for field_name, field_meta in self.field_metadata.items():
+            field_meta.remove_samples(indexes_to_release)
+            if len(field_meta.global_indexes) == 0:
+                empty_fields.append(field_name)
+        if len(self.global_indexes) == 0:
+            self.field_metadata.clear()
+        else:
+            for field_name in empty_fields:
+                self.field_metadata.pop(field_name)
+        for idx in indexes_to_release:
+            self.field_custom_backend_meta.pop(idx, None)
+            self.custom_meta.pop(idx, None)
+
+            if idx in self.revert_keys_mapping:
+                self.keys_mapping.pop(self.revert_keys_mapping[idx], None)
+                self.revert_keys_mapping.pop(idx, None)
+
     def clear_data(self, indexes_to_release: list[int], clear_consumption: bool = True):
         """Clear all production and optionally consumption data for given global_indexes."""
         try:
-            if self.production_status is not None:
-                self.production_status[indexes_to_release, :] = 0
-
-            if clear_consumption:
-                for consumption_tensor in self.consumption_status.values():
-                    consumption_tensor[indexes_to_release] = 0
-
-            self.global_indexes.difference_update(indexes_to_release)
-
-            empty_fields = []
-            for field_name, field_meta in self.field_metadata.items():
-                field_meta.remove_samples(indexes_to_release)
-                if len(field_meta.global_indexes) == 0:
-                    empty_fields.append(field_name)
-            if len(self.global_indexes) == 0:
-                # clear the whole field_meta if the whole partition is empty
-                self.field_metadata.clear()
-            else:
-                # only clear empty fields
-                for field_name in empty_fields:
-                    self.field_metadata.pop(field_name)
-            for idx in indexes_to_release:
-                self.field_custom_backend_meta.pop(idx, None)
-                self.custom_meta.pop(idx, None)
-
-                if idx in self.revert_keys_mapping:
-                    self.keys_mapping.pop(self.revert_keys_mapping[idx], None)
-                    self.revert_keys_mapping.pop(idx, None)
-
+            self._drop_indexes(indexes_to_release, clear_consumption=clear_consumption)
         except Exception as e:
             logger.error(
                 f"Error clearing data for partition {self.partition_id}: {e}. "
@@ -2196,24 +2199,45 @@ class TransferQueueController:
                 )
 
         elif request_msg.request_type == ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT:
-            path = request_msg.body["path"]
-            self.save_checkpoint(path)
-            response_msg = ZMQMessage.create(
-                request_type=ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT_RESPONSE,
-                sender_id=self.controller_id,
-                receiver_id=request_msg.sender_id,
-                body={"success": True},
-            )
+            try:
+                params = request_msg.body
+                produced_global_indexes = self.save_checkpoint(
+                    params["path"],
+                    selection=params.get("selection"),
+                    manifest_path=params.get("manifest_path"),
+                )
+                response_msg = ZMQMessage.create(
+                    request_type=ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT_RESPONSE,
+                    sender_id=self.controller_id,
+                    receiver_id=request_msg.sender_id,
+                    body={"success": True, "produced_global_indexes": produced_global_indexes},
+                )
+            except Exception as e:
+                logger.exception(f"[{self.controller_id}]: controller checkpoint save failed")
+                response_msg = ZMQMessage.create(
+                    request_type=ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT_RESPONSE,
+                    sender_id=self.controller_id,
+                    receiver_id=request_msg.sender_id,
+                    body={"success": False, "message": str(e)},
+                )
 
         elif request_msg.request_type == ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT:
-            path = request_msg.body["path"]
-            self.load_checkpoint(path)
-            response_msg = ZMQMessage.create(
-                request_type=ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT_RESPONSE,
-                sender_id=self.controller_id,
-                receiver_id=request_msg.sender_id,
-                body={"success": True},
-            )
+            try:
+                self.load_checkpoint(request_msg.body["path"])
+                response_msg = ZMQMessage.create(
+                    request_type=ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT_RESPONSE,
+                    sender_id=self.controller_id,
+                    receiver_id=request_msg.sender_id,
+                    body={"success": True},
+                )
+            except Exception as e:
+                logger.exception(f"[{self.controller_id}]: controller checkpoint load failed")
+                response_msg = ZMQMessage.create(
+                    request_type=ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT_RESPONSE,
+                    sender_id=self.controller_id,
+                    receiver_id=request_msg.sender_id,
+                    body={"success": False, "message": str(e)},
+                )
 
         return response_msg
 
@@ -2229,19 +2253,43 @@ class TransferQueueController:
         """Retrieve the global config of TransferQueue."""
         return self.tq_config
 
-    def save_checkpoint(self, path: str) -> None:
-        """Serialize controller state directly to a file.
+    @staticmethod
+    def _filter_sampler_state(state: dict[str, Any], selected_by_partition: dict[str, set[int]]) -> dict[str, Any]:
+        """Drop sampler cache entries that point to rows omitted from a snapshot."""
+        filtered = copy.deepcopy(state)
+        states = filtered.get("_states")
+        if isinstance(states, dict):
+            for partition_id in list(states):
+                selected = selected_by_partition.get(partition_id)
+                if selected is None:
+                    states.pop(partition_id, None)
+                    continue
+                for task_states in states[partition_id].values():
+                    for rank_states in task_states.values():
+                        for batch_index, result in list(rank_states.items()):
+                            if isinstance(result, tuple) and len(result) == 2:
+                                rank_states[batch_index] = tuple(
+                                    [idx for idx in values if idx in selected] if isinstance(values, list) else values
+                                    for values in result
+                                )
+        balanced_cache = filtered.get("_balanced_cache")
+        if isinstance(balanced_cache, dict):
+            for cache_key in list(balanced_cache):
+                partition_id = cache_key[0] if isinstance(cache_key, tuple) and cache_key else cache_key
+                selected = selected_by_partition.get(partition_id)
+                if selected is None:
+                    balanced_cache.pop(cache_key, None)
+                elif isinstance(balanced_cache[cache_key], list):
+                    balanced_cache[cache_key] = [idx for idx in balanced_cache[cache_key] if idx in selected]
+        return filtered
 
-        Writes in-process to avoid transmitting the payload back over the
-        Ray object store.
-
-        Args:
-            path: Absolute path for the output .pkl file.
-
-        Raises:
-            Exception: If serialization or file I/O fails.
-        """
-        try:
+    def _build_checkpoint_state(
+        self,
+        selection: dict[str, list[str]] | None,
+        manifest_path: str | None,
+    ) -> tuple[dict[str, Any], list[int] | None]:
+        """Build a full or key-selective controller snapshot."""
+        if selection is None:
             state = {
                 "controller_id": self.controller_id,
                 "partitions": {pid: p.to_snapshot() for pid, p in self.partitions.items()},
@@ -2253,9 +2301,89 @@ class TransferQueueController:
                 },
                 "sampler": self.sampler.save_checkpoint(),
             }
+            return state, None
+
+        if len(selection) != 1:
+            raise ValueError("selective checkpoint currently supports exactly one partition")
+
+        partition_id, requested_keys = next(iter(selection.items()))
+        partition = self._get_partition(partition_id)
+        if partition is None:
+            raise KeyError(f"partition {partition_id!r} does not exist")
+        requested_keys = list(dict.fromkeys(requested_keys))
+        selected_indexes = partition.kv_retrieve_indexes(requested_keys)
+        missing = [key for key, index in zip(requested_keys, selected_indexes, strict=True) if index is None]
+        if missing:
+            raise KeyError(f"keys not found in partition {partition_id!r}: {missing}")
+        selected_set = set(cast(list[int], selected_indexes))
+
+        snapshot = partition.to_snapshot()
+        rows_to_drop = (snapshot.global_indexes | snapshot.pre_allocated_global_indexes) - selected_set
+        snapshot._drop_indexes(sorted(rows_to_drop))
+
+        # Only the selected partition belongs in a selective checkpoint. Keep
+        # the original global index space so storage routing remains unchanged.
+        old_partition_indexes = set(self.index_manager.partition_to_indexes.get(partition_id, set()))
+        old_allocated = set(self.index_manager.allocated_indexes)
+        old_reusable = set(self.index_manager.reusable_indexes)
+        selected_partition_indexes = old_partition_indexes & selected_set
+        state = {
+            "controller_id": self.controller_id,
+            "partitions": {partition_id: snapshot},
+            "index_manager": {
+                "partition_to_indexes": {partition_id: selected_partition_indexes},
+                "reusable_indexes": sorted((old_allocated | old_reusable) - selected_set),
+                "global_index_counter": self.index_manager.global_index_counter,
+                "allocated_indexes": old_allocated & selected_set,
+            },
+            "sampler": self._filter_sampler_state(self.sampler.save_checkpoint(), {partition_id: selected_set}),
+        }
+        produced_indexes = sorted(selected_set & snapshot.global_indexes)
+
+        if manifest_path is not None:
+            manifest = {
+                "partition_id": partition_id,
+                "keys": {
+                    key: sorted(
+                        field_name
+                        for field_name, field_meta in snapshot.field_metadata.items()
+                        if index in field_meta.global_indexes
+                    )
+                    for key, index in zip(requested_keys, selected_indexes, strict=True)
+                },
+            }
+            with open(manifest_path, "w", encoding="utf-8") as f:
+                json.dump(manifest, f, indent=2)
+        return state, produced_indexes
+
+    def save_checkpoint(
+        self,
+        path: str,
+        *,
+        selection: dict[str, list[str]] | None = None,
+        manifest_path: str | None = None,
+    ) -> list[int] | None:
+        """Serialize controller state directly to a file.
+
+        Writes in-process to avoid transmitting the payload back over the
+        Ray object store.
+
+        Args:
+            path: Absolute path for the output .pkl file.
+            selection: Optional ``{partition_id: keys}`` mapping. When set,
+                only the selected rows are written and their global indexes
+                are returned to the caller.
+            manifest_path: Optional path for the key-to-field manifest.
+
+        Raises:
+            Exception: If serialization or file I/O fails.
+        """
+        try:
+            state, produced_indexes = self._build_checkpoint_state(selection, manifest_path)
             with open(path, "wb") as f:
                 pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
             logger.info(f"[{self.controller_id}]: dumped to {path}")
+            return produced_indexes
         except Exception as e:
             raise RuntimeError(f"[{self.controller_id}]: save checkpoint failed: {e}") from e
 
