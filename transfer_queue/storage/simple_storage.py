@@ -790,6 +790,12 @@ class SimpleStorageUnit:
             }
             with open(path, "wb") as f:
                 pickle.dump(shard, f, protocol=pickle.HIGHEST_PROTOCOL)
+                # Report success only once the shard is on disk. Without this the call
+                # returns while the payload is still dirty page cache, and a node that
+                # dies before writeback leaves a dump whose manifest claims rows that
+                # cannot be read back.
+                f.flush()
+                os.fsync(f.fileno())
             logger.info(f"[{self.storage_unit_id}]: dumped {len(dumped_indexes)} rows to {path}")
             return ZMQMessage.create(
                 request_type=ZMQRequestType.DUMP_ROWS_RESPONSE,  # type: ignore[arg-type]

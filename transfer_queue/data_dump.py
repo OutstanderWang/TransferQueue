@@ -32,6 +32,7 @@ Layout::
 """
 
 import json
+import os
 import shutil
 from pathlib import Path
 from typing import Any
@@ -48,6 +49,26 @@ _DUMP_INFO_FILE = "dump_info.json"
 _ROW_INDEX_FILE = "row_index.pt"
 _SHARD_SUBDIR = "shards"
 _SHARD_INFO_FILE = "shard_info.json"
+
+
+def _fsync_file(file_object: Any) -> None:
+    """Push a just-written file out of page cache before the caller moves on."""
+    file_object.flush()
+    os.fsync(file_object.fileno())
+
+
+def _fsync_directory(path: Path) -> None:
+    """Make a directory's own entries durable.
+
+    fsync on a file says nothing about the directory entry naming it, so a crash can
+    lose a file that was itself fully synced. The rename that publishes the dump needs
+    the same treatment.
+    """
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
 
 
 def dump_data_by_key(dump_dir: str | Path, keys: list[str], partition_id: str) -> dict[str, int]:
@@ -106,10 +127,16 @@ def dump_data_by_key(dump_dir: str | Path, keys: list[str], partition_id: str) -
         shard_dir.mkdir(parents=True, exist_ok=True)
         with open(shard_dir / _SHARD_INFO_FILE, "w", encoding="utf-8") as f:
             json.dump(shard_records, f)
+            _fsync_file(f)
+        # The shards themselves were synced by the units that wrote them, but their
+        # directory entries were created here, on this node.
+        _fsync_directory(shard_dir)
 
         # torch.save rather than json: a tag is an arbitrary picklable dict, and this
         # path must not fail on a tag that happens to hold a tensor.
-        torch.save({"partition_id": partition_id, "rows": rows}, tmp_dir / _ROW_INDEX_FILE)
+        with open(tmp_dir / _ROW_INDEX_FILE, "wb") as f:
+            torch.save({"partition_id": partition_id, "rows": rows}, f)
+            _fsync_file(f)
 
         with open(tmp_dir / _DUMP_INFO_FILE, "w", encoding="utf-8") as f:
             json.dump(
@@ -123,10 +150,15 @@ def dump_data_by_key(dump_dir: str | Path, keys: list[str], partition_id: str) -
                 f,
                 indent=2,
             )
+            _fsync_file(f)
+        # Everything the dump claims is now durable, so the staging directory can be
+        # published. Syncing the parent makes the rename itself survive a crash.
+        _fsync_directory(tmp_dir)
 
         if dump_dir.exists():
             shutil.rmtree(dump_dir)
         tmp_dir.rename(dump_dir)
+        _fsync_directory(dump_dir.parent)
     except Exception:
         if tmp_dir.exists():
             shutil.rmtree(tmp_dir)
