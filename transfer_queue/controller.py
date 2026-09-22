@@ -14,7 +14,6 @@
 # limitations under the License.
 
 import copy
-import json
 import os
 import pickle
 import time
@@ -888,55 +887,38 @@ class DataPartitionStatus:
             setattr(snapshot, name, new_val)
         return snapshot
 
-    def _drop_indexes(self, indexes_to_release: list[int], clear_consumption: bool = True):
-        """Remove rows from a partition, letting consistency errors propagate.
-
-        This is the body of ``clear_data``. Kept separate so a checkpoint snapshot can
-        prune rows and see a failure, while ``clear_data`` keeps logging and swallowing.
-        """
-        if self.production_status is not None:
-            self.production_status[indexes_to_release, :] = 0
-
-        if clear_consumption:
-            for consumption_tensor in self.consumption_status.values():
-                consumption_tensor[indexes_to_release] = 0
-
-        self.global_indexes.difference_update(indexes_to_release)
-
-        empty_fields = []
-        for field_name, field_meta in self.field_metadata.items():
-            field_meta.remove_samples(indexes_to_release)
-            if len(field_meta.global_indexes) == 0:
-                empty_fields.append(field_name)
-        if len(self.global_indexes) == 0:
-            # clear the whole field_meta if the whole partition is empty
-            self.field_metadata.clear()
-        else:
-            # only clear empty fields
-            for field_name in empty_fields:
-                self.field_metadata.pop(field_name)
-        for idx in indexes_to_release:
-            self.field_custom_backend_meta.pop(idx, None)
-            self.custom_meta.pop(idx, None)
-
-            if idx in self.revert_keys_mapping:
-                self.keys_mapping.pop(self.revert_keys_mapping[idx], None)
-                self.revert_keys_mapping.pop(idx, None)
-
-    def retain_only_indexes(self, indexes_to_keep: set[int]) -> None:
-        """Prune this partition down to ``indexes_to_keep``.
-
-        Intended for a detached snapshot, never for the controller's live partition.
-        Unlike ``clear_data`` this also drops pre-allocated rows, so a snapshot does not
-        claim indexes whose data it did not serialize.
-        """
-        self._drop_indexes(sorted((self.global_indexes | self.pre_allocated_global_indexes) - indexes_to_keep))
-        self.pre_allocated_global_indexes.intersection_update(indexes_to_keep)
-
     def clear_data(self, indexes_to_release: list[int], clear_consumption: bool = True):
         """Clear all production and optionally consumption data for given global_indexes."""
         try:
-            self._drop_indexes(indexes_to_release, clear_consumption=clear_consumption)
+            if self.production_status is not None:
+                self.production_status[indexes_to_release, :] = 0
+
+            if clear_consumption:
+                for consumption_tensor in self.consumption_status.values():
+                    consumption_tensor[indexes_to_release] = 0
+
+            self.global_indexes.difference_update(indexes_to_release)
+
+            empty_fields = []
+            for field_name, field_meta in self.field_metadata.items():
+                field_meta.remove_samples(indexes_to_release)
+                if len(field_meta.global_indexes) == 0:
+                    empty_fields.append(field_name)
+            if len(self.global_indexes) == 0:
+                # clear the whole field_meta if the whole partition is empty
+                self.field_metadata.clear()
+            else:
+                # only clear empty fields
+                for field_name in empty_fields:
+                    self.field_metadata.pop(field_name)
+            for idx in indexes_to_release:
+                self.field_custom_backend_meta.pop(idx, None)
+                self.custom_meta.pop(idx, None)
+
+                if idx in self.revert_keys_mapping:
+                    self.keys_mapping.pop(self.revert_keys_mapping[idx], None)
+                    self.revert_keys_mapping.pop(idx, None)
+
         except Exception as e:
             logger.error(
                 f"Error clearing data for partition {self.partition_id}: {e}. "
@@ -1732,6 +1714,48 @@ class TransferQueueController:
 
         return keys
 
+    # ==================== Selective Data Dump API ====================
+
+    def describe_rows_by_key(self, partition_id: str, keys: list[str]) -> dict[str, dict[str, Any]]:
+        """Describe the key-addressed rows a selective dump needs, without copying them.
+
+        Returns only metadata, so the caller can write a row index and route the payload
+        dump to the storage units that hold it. Deliberately avoids ``to_snapshot``: a
+        dump needs a handful of lookups per key, not a deep copy of the whole partition.
+
+        Args:
+            partition_id: Partition that owns ``keys``.
+            keys: Keys to describe, already deduplicated by the caller.
+
+        Returns:
+            ``{key: {"global_index": int, "fields": list[str], "tag": dict}}``. ``fields``
+            is empty for a row that exists in metadata but has no produced field yet.
+
+        Raises:
+            KeyError: The partition or any key does not exist.
+        """
+        partition = self._get_partition(partition_id)
+        if partition is None:
+            raise KeyError(f"partition {partition_id!r} does not exist; existing partitions: {sorted(self.partitions)}")
+
+        global_indexes = partition.kv_retrieve_indexes(keys)
+        missing_keys = [key for key, index in zip(keys, global_indexes, strict=True) if index is None]
+        if missing_keys:
+            raise KeyError(f"keys not found in partition {partition_id!r}: {missing_keys}")
+
+        return {
+            key: {
+                "global_index": global_index,
+                "fields": sorted(
+                    field_name
+                    for field_name, field_meta in partition.field_metadata.items()
+                    if global_index in field_meta.global_indexes
+                ),
+                "tag": partition.custom_meta.get(global_index, {}),
+            }
+            for key, global_index in zip(keys, global_indexes, strict=True)
+        }
+
     def _init_zmq_socket(self):
         """Initialize ZMQ sockets for communication."""
         self.zmq_context = zmq.Context()
@@ -2213,6 +2237,25 @@ class TransferQueueController:
                     body={"partition_info": partition_info, "message": message},
                 )
 
+        elif request_msg.request_type == ZMQRequestType.DESCRIBE_ROWS_BY_KEY:
+            try:
+                params = request_msg.body
+                rows = self.describe_rows_by_key(params["partition_id"], params["keys"])
+                response_msg = ZMQMessage.create(
+                    request_type=ZMQRequestType.DESCRIBE_ROWS_BY_KEY_RESPONSE,
+                    sender_id=self.controller_id,
+                    receiver_id=request_msg.sender_id,
+                    body={"success": True, "rows": rows},
+                )
+            except Exception as e:
+                logger.exception(f"[{self.controller_id}]: describe_rows_by_key failed")
+                response_msg = ZMQMessage.create(
+                    request_type=ZMQRequestType.DESCRIBE_ROWS_BY_KEY_RESPONSE,
+                    sender_id=self.controller_id,
+                    receiver_id=request_msg.sender_id,
+                    body={"success": False, "message": str(e)},
+                )
+
         elif request_msg.request_type == ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT:
             path = request_msg.body["path"]
             self.save_checkpoint(path)
@@ -2222,30 +2265,6 @@ class TransferQueueController:
                 receiver_id=request_msg.sender_id,
                 body={"success": True},
             )
-
-        elif request_msg.request_type == ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT_BY_KEY:
-            try:
-                params = request_msg.body
-                produced_global_indexes = self.save_checkpoint_by_key(
-                    params["path"],
-                    params["partition_id"],
-                    params["keys"],
-                    manifest_path=params.get("manifest_path"),
-                )
-                response_msg = ZMQMessage.create(
-                    request_type=ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT_BY_KEY_RESPONSE,
-                    sender_id=self.controller_id,
-                    receiver_id=request_msg.sender_id,
-                    body={"success": True, "produced_global_indexes": produced_global_indexes},
-                )
-            except Exception as e:
-                logger.exception(f"[{self.controller_id}]: controller checkpoint save by key failed")
-                response_msg = ZMQMessage.create(
-                    request_type=ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT_BY_KEY_RESPONSE,
-                    sender_id=self.controller_id,
-                    receiver_id=request_msg.sender_id,
-                    body={"success": False, "message": str(e)},
-                )
 
         elif request_msg.request_type == ZMQRequestType.LOAD_CONTROLLER_CHECKPOINT:
             path = request_msg.body["path"]
@@ -2270,36 +2289,6 @@ class TransferQueueController:
     def get_config(self) -> DictConfig:
         """Retrieve the global config of TransferQueue."""
         return self.tq_config
-
-    @staticmethod
-    def _filter_sampler_state(state: dict[str, Any], selected_by_partition: dict[str, set[int]]) -> dict[str, Any]:
-        """Drop sampler cache entries that point to rows omitted from a snapshot."""
-        filtered = copy.deepcopy(state)
-        states = filtered.get("_states")
-        if isinstance(states, dict):
-            for partition_id in list(states):
-                selected = selected_by_partition.get(partition_id)
-                if selected is None:
-                    states.pop(partition_id, None)
-                    continue
-                for task_states in states[partition_id].values():
-                    for rank_states in task_states.values():
-                        for batch_index, result in list(rank_states.items()):
-                            if isinstance(result, tuple) and len(result) == 2:
-                                rank_states[batch_index] = tuple(
-                                    [idx for idx in values if idx in selected] if isinstance(values, list) else values
-                                    for values in result
-                                )
-        balanced_cache = filtered.get("_balanced_cache")
-        if isinstance(balanced_cache, dict):
-            for cache_key in list(balanced_cache):
-                partition_id = cache_key[0] if isinstance(cache_key, tuple) and cache_key else cache_key
-                selected = selected_by_partition.get(partition_id)
-                if selected is None:
-                    balanced_cache.pop(cache_key, None)
-                elif isinstance(balanced_cache[cache_key], list):
-                    balanced_cache[cache_key] = [idx for idx in balanced_cache[cache_key] if idx in selected]
-        return filtered
 
     def save_checkpoint(self, path: str) -> None:
         """Serialize controller state directly to a file.
@@ -2330,103 +2319,6 @@ class TransferQueueController:
             logger.info(f"[{self.controller_id}]: dumped to {path}")
         except Exception as e:
             raise RuntimeError(f"[{self.controller_id}]: save checkpoint failed: {e}") from e
-
-    def _resolve_selected_indexes(self, partition_id: str, keys: list[str]) -> tuple[DataPartitionStatus, list[int]]:
-        """Translate keys into global indexes, rejecting an unknown partition or key."""
-        partition = self._get_partition(partition_id)
-        if partition is None:
-            raise KeyError(f"partition {partition_id!r} does not exist; existing partitions: {sorted(self.partitions)}")
-        selected_indexes = partition.kv_retrieve_indexes(keys)
-        missing_keys = [key for key, index in zip(keys, selected_indexes, strict=True) if index is None]
-        if missing_keys:
-            raise KeyError(f"keys not found in partition {partition_id!r}: {missing_keys}")
-        return partition, cast(list[int], selected_indexes)
-
-    def _write_selection_manifest(
-        self,
-        manifest_path: str,
-        partition_id: str,
-        keys: list[str],
-        selected_indexes: list[int],
-        snapshot: DataPartitionStatus,
-    ) -> None:
-        """Write the key-to-field listing that describes a selective checkpoint."""
-        manifest = {
-            "partition_id": partition_id,
-            "keys": {
-                key: sorted(
-                    field_name
-                    for field_name, field_meta in snapshot.field_metadata.items()
-                    if index in field_meta.global_indexes
-                )
-                for key, index in zip(keys, selected_indexes, strict=True)
-            },
-        }
-        with open(manifest_path, "w", encoding="utf-8") as f:
-            json.dump(manifest, f, indent=2)
-
-    def save_checkpoint_by_key(
-        self,
-        path: str,
-        partition_id: str,
-        keys: list[str],
-        manifest_path: str | None = None,
-    ) -> list[int]:
-        """Serialize only the key-addressed rows of one partition to a file.
-
-        The snapshot keeps each selected row's original global index, field schema, tags,
-        and production/consumption state, so storage routing is identical to a full
-        checkpoint. Every other partition is omitted. ``load_checkpoint`` reads the result.
-
-        Args:
-            path: Absolute path for the output .pkl file.
-            partition_id: Partition that owns ``keys``.
-            keys: Keys to save, already deduplicated by the caller.
-            manifest_path: Optional path for the key-to-field manifest.
-
-        Returns:
-            Global indexes of the selected rows whose data was actually produced. These
-            are the rows the caller must ask the storage backend to serialize.
-
-        Raises:
-            RuntimeError: If the partition or a key is unknown, or file I/O fails.
-        """
-        try:
-            partition, selected_indexes = self._resolve_selected_indexes(partition_id, keys)
-            selected_set = set(selected_indexes)
-
-            snapshot = partition.to_snapshot()
-            snapshot.retain_only_indexes(selected_set)
-
-            # Keep the original global index space so a restored row still routes to the
-            # storage unit that holds it. Indexes left out of the snapshot become reusable.
-            allocated_indexes = set(self.index_manager.allocated_indexes)
-            reusable_indexes = set(self.index_manager.reusable_indexes)
-            state = {
-                "controller_id": self.controller_id,
-                "partitions": {partition_id: snapshot},
-                "index_manager": {
-                    "partition_to_indexes": {
-                        partition_id: set(self.index_manager.partition_to_indexes.get(partition_id, set()))
-                        & selected_set
-                    },
-                    "reusable_indexes": sorted((allocated_indexes | reusable_indexes) - selected_set),
-                    "global_index_counter": self.index_manager.global_index_counter,
-                    "allocated_indexes": allocated_indexes & selected_set,
-                },
-                "sampler": self._filter_sampler_state(self.sampler.save_checkpoint(), {partition_id: selected_set}),
-            }
-
-            if manifest_path is not None:
-                self._write_selection_manifest(manifest_path, partition_id, keys, selected_indexes, snapshot)
-
-            with open(path, "wb") as f:
-                pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
-            logger.info(f"[{self.controller_id}]: dumped {len(selected_set)} selected rows to {path}")
-
-            return sorted(selected_set & snapshot.global_indexes)
-        except Exception as e:
-            raise RuntimeError(f"[{self.controller_id}]: save checkpoint by key failed: {e}") from e
 
     def load_checkpoint(self, path: str) -> None:
         """Restore controller state directly from a file.

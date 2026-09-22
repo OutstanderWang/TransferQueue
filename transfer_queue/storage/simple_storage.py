@@ -439,8 +439,8 @@ class SimpleStorageUnit:
                         response_msg = self._handle_get_metrics()
                     elif operation == ZMQRequestType.SAVE_STORAGE_CHECKPOINT:  # type: ignore[arg-type]
                         response_msg = self._handle_save_checkpoint(request_msg)
-                    elif operation == ZMQRequestType.SAVE_STORAGE_CHECKPOINT_BY_INDEX:  # type: ignore[arg-type]
-                        response_msg = self._handle_save_checkpoint_by_index(request_msg)
+                    elif operation == ZMQRequestType.DUMP_ROWS:  # type: ignore[arg-type]
+                        response_msg = self._handle_dump_rows(request_msg)
                     elif operation == ZMQRequestType.LOAD_STORAGE_CHECKPOINT:  # type: ignore[arg-type]
                         response_msg = self._handle_load_checkpoint(request_msg)
                     else:
@@ -753,55 +753,57 @@ class SimpleStorageUnit:
                 body={"success": False, "message": str(e)},
             )
 
-    def _handle_save_checkpoint_by_index(self, data_parts) -> ZMQMessage:
-        """Serialize only the requested rows of this storage unit to a file.
+    def _handle_dump_rows(self, data_parts) -> ZMQMessage:
+        """Serialize the requested rows of this unit into a self-contained shard.
+
+        This runs inside the storage unit process, so the payload is pickled where it
+        already lives instead of being shipped to the caller first. The shard is keyed
+        by global index; the caller holds the row index that maps keys onto them.
 
         Args:
-            data_parts: ZMQMessage from client, containing ``path`` and
-                ``global_indexes`` in body. ``path`` must be reachable from the
-                node running this actor (shared filesystem required for
-                multi-node setups), and ``global_indexes`` is the subset this
-                unit owns, already routed by the storage manager.
+            data_parts: ZMQMessage with ``path`` and ``global_indexes`` in body.
+                ``path`` must be reachable from the node running this actor, which
+                means a shared filesystem in a multi-node deployment.
+                ``global_indexes`` is the subset this unit owns, already routed by
+                the storage manager.
 
         Returns:
-            ZMQMessage with ``success=True``, ``saved_rows``, and ``missing_rows``
-            on success, or ``success=False`` and ``message`` on failure.
-            ``missing_rows`` lists requested rows this unit holds no data for.
+            ZMQMessage with ``success=True``, ``dumped_rows`` and ``missing_rows`` on
+            success, or ``success=False`` and ``message`` on failure. ``missing_rows``
+            lists requested rows this unit holds no data for.
         """
         path = data_parts.body["path"]
-        selected_indexes = set(data_parts.body["global_indexes"])
+        requested_indexes = set(data_parts.body["global_indexes"])
         try:
             field_data = {}
             for field_name, values in self.storage_data.field_data.items():
                 selected_values = {
-                    global_index: values[global_index] for global_index in selected_indexes if global_index in values
+                    global_index: values[global_index] for global_index in requested_indexes if global_index in values
                 }
                 if selected_values:
                     field_data[field_name] = selected_values
-            active_keys = self.storage_data._active_keys & selected_indexes
-            state = {
+            dumped_indexes = self.storage_data._active_keys & requested_indexes
+            shard = {
                 "storage_unit_id": self.storage_unit_id,
-                "storage_unit_size": self.storage_unit_size,
                 "field_data": field_data,
-                "active_keys": active_keys,
-                "selective": True,
+                "global_indexes": sorted(dumped_indexes),
             }
             with open(path, "wb") as f:
-                pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
-            logger.info(f"[{self.storage_unit_id}]: saved {len(active_keys)} selected rows to {path}")
+                pickle.dump(shard, f, protocol=pickle.HIGHEST_PROTOCOL)
+            logger.info(f"[{self.storage_unit_id}]: dumped {len(dumped_indexes)} rows to {path}")
             return ZMQMessage.create(
-                request_type=ZMQRequestType.SAVE_STORAGE_CHECKPOINT_BY_INDEX_RESPONSE,  # type: ignore[arg-type]
+                request_type=ZMQRequestType.DUMP_ROWS_RESPONSE,  # type: ignore[arg-type]
                 sender_id=self.storage_unit_id,
                 body={
                     "success": True,
-                    "saved_rows": len(active_keys),
-                    "missing_rows": sorted(selected_indexes - self.storage_data._active_keys),
+                    "dumped_rows": len(dumped_indexes),
+                    "missing_rows": sorted(requested_indexes - self.storage_data._active_keys),
                 },
             )
         except Exception as e:
-            logger.error(f"[{self.storage_unit_id}]: save checkpoint by index failed: {e}")
+            logger.error(f"[{self.storage_unit_id}]: dump rows failed: {e}")
             return ZMQMessage.create(
-                request_type=ZMQRequestType.SAVE_STORAGE_CHECKPOINT_BY_INDEX_RESPONSE,  # type: ignore[arg-type]
+                request_type=ZMQRequestType.DUMP_ROWS_RESPONSE,  # type: ignore[arg-type]
                 sender_id=self.storage_unit_id,
                 body={"success": False, "message": str(e)},
             )

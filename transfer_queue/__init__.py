@@ -16,6 +16,7 @@
 import os
 
 from .client import TransferQueueClient
+from .data_dump import dump_data_by_key, load_data_by_key, read_row_index
 from .dataloader import StreamingDataLoader, StreamingDataset
 from .interface import (
     async_kv_batch_get,
@@ -36,7 +37,6 @@ from .interface import (
     kv_put,
     load_checkpoint,
     save_checkpoint,
-    save_checkpoint_by_key,
 )
 from .metadata import BatchMeta, KVBatchMeta
 from .sampler import BaseSampler
@@ -68,8 +68,13 @@ __all__ = (
     + [
         # Checkpoint Interface
         "save_checkpoint",
-        "save_checkpoint_by_key",
         "load_checkpoint",
+    ]
+    + [
+        # Selective Data Dump Interface
+        "dump_data_by_key",
+        "load_data_by_key",
+        "read_row_index",
     ]
     + [
         # High-Level StreamingDataLoader Interface
