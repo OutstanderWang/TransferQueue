@@ -25,6 +25,7 @@ import psutil
 import ray
 import zmq
 
+from transfer_queue.utils import compact_pickle
 from transfer_queue.utils.common import (
     estimate_payload_bytes,
     get_env_bool,
@@ -789,7 +790,7 @@ class SimpleStorageUnit:
                 "global_indexes": sorted(dumped_indexes),
             }
             with open(path, "wb") as f:
-                pickle.dump(shard, f, protocol=pickle.HIGHEST_PROTOCOL)
+                compact_pickle.dump(shard, f)
                 # Report success only once the shard is on disk. Without this the call
                 # returns while the payload is still dirty page cache, and a node that
                 # dies before writeback leaves a dump whose manifest claims rows that
