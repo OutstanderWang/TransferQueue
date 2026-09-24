@@ -538,13 +538,12 @@ class DataPartitionStatus:
                 required_fields = len(self.field_name_mapping)
                 self.ensure_fields_capacity(required_fields)
 
-            # Update production status
+            # Validate all field updates before changing readiness or field metadata.
+            self.validate_field_schema(field_schema)
+            self._update_field_metadata(global_indices, field_schema, custom_backend_meta)
             if self.production_status is not None and global_indices and field_names:
                 field_indices = [self.field_name_mapping.get(f) for f in field_names]
                 self.production_status[torch.tensor(global_indices)[:, None], torch.tensor(field_indices)] = 1
-
-            # Update field metadata
-            self._update_field_metadata(global_indices, field_schema, custom_backend_meta)
 
             # Save these global_indexes
             self.global_indexes.update(global_indices)
@@ -554,6 +553,18 @@ class DataPartitionStatus:
         except Exception as e:
             logger.error(f"Error updating production status for partition {self.partition_id}: {e}")
             return False
+
+    def validate_field_schema(self, field_schema: dict[str, dict[str, Any]]) -> None:
+        """Reject incompatible field types without changing metadata or readiness."""
+        for name, incoming in field_schema.items():
+            existing = self.field_metadata.get(name)
+            if existing is None:
+                continue
+            if bool(existing.is_non_tensor) != bool(incoming.get("is_non_tensor", False)):
+                raise ValueError(f"Field {name!r} tensor/non-tensor type mismatch")
+            dtype = incoming.get("dtype")
+            if dtype is not None and existing.dtype is not None and dtype != existing.dtype:
+                raise ValueError(f"Field {name!r} dtype mismatch: {existing.dtype} != {dtype}")
 
     def _update_field_metadata(
         self,
@@ -2238,23 +2249,12 @@ class TransferQueueController:
                 )
 
         elif request_msg.request_type == ZMQRequestType.DESCRIBE_ROWS_BY_KEY:
-            try:
-                params = request_msg.body
-                rows = self.describe_rows_by_key(params["partition_id"], params["keys"])
-                response_msg = ZMQMessage.create(
-                    request_type=ZMQRequestType.DESCRIBE_ROWS_BY_KEY_RESPONSE,
-                    sender_id=self.controller_id,
-                    receiver_id=request_msg.sender_id,
-                    body={"success": True, "rows": rows},
-                )
-            except Exception as e:
-                logger.exception(f"[{self.controller_id}]: describe_rows_by_key failed")
-                response_msg = ZMQMessage.create(
-                    request_type=ZMQRequestType.DESCRIBE_ROWS_BY_KEY_RESPONSE,
-                    sender_id=self.controller_id,
-                    receiver_id=request_msg.sender_id,
-                    body={"success": False, "message": str(e)},
-                )
+            with monitor.measure(op_type="DESCRIBE_ROWS_BY_KEY"):
+                response_msg = self._handle_describe_rows_by_key_request(request_msg)
+
+        elif request_msg.request_type == ZMQRequestType.VALIDATE_DUMP_SCHEMA:
+            with monitor.measure(op_type="VALIDATE_DUMP_SCHEMA"):
+                response_msg = self._handle_validate_dump_schema_request(request_msg)
 
         elif request_msg.request_type == ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT:
             path = request_msg.body["path"]
@@ -2277,6 +2277,46 @@ class TransferQueueController:
             )
 
         return response_msg
+
+    def _make_response(
+        self,
+        request_msg: ZMQMessage,
+        response_type: ZMQRequestType,
+        body: dict[str, Any],
+    ) -> ZMQMessage:
+        """Build a controller response addressed to the request sender."""
+        return ZMQMessage.create(
+            request_type=response_type,
+            sender_id=self.controller_id,
+            receiver_id=request_msg.sender_id,
+            body=body,
+        )
+
+    def _handle_describe_rows_by_key_request(self, request_msg: ZMQMessage) -> ZMQMessage:
+        params = request_msg.body
+        rows = self.describe_rows_by_key(params["partition_id"], params["keys"])
+        partition = self.partitions[params["partition_id"]]
+        field_schema = {}
+        for name, meta in partition.field_metadata.items():
+            indexes = [row["global_index"] for row in rows.values() if name in row["fields"]]
+            if not indexes:
+                continue
+            schema = meta.to_batch_schema(indexes)
+            if schema.get("is_nested"):
+                schema["per_sample_shapes"] = {index: meta.per_sample_shapes[index] for index in indexes}
+            field_schema[name] = schema
+        return self._make_response(
+            request_msg,
+            ZMQRequestType.DESCRIBE_ROWS_BY_KEY_RESPONSE,
+            {"success": True, "partition_id": params["partition_id"], "rows": rows, "field_schema": field_schema},
+        )
+
+    def _handle_validate_dump_schema_request(self, request_msg: ZMQMessage) -> ZMQMessage:
+        params = request_msg.body
+        partition = self._get_partition(params["partition_id"])
+        if partition is not None:
+            partition.validate_field_schema(params["field_schema"])
+        return self._make_response(request_msg, ZMQRequestType.VALIDATE_DUMP_SCHEMA_RESPONSE, {"success": True})
 
     def get_zmq_server_info(self) -> ZMQServerInfo:
         """Get ZMQ server connection information."""
