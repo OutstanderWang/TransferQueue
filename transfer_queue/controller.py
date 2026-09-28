@@ -21,7 +21,7 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from itertools import groupby
 from operator import itemgetter
-from threading import Thread
+from threading import RLock, Thread
 from typing import TYPE_CHECKING, Any, cast
 from uuid import uuid4
 
@@ -39,6 +39,7 @@ from transfer_queue.sampler import BaseSampler, SequentialSampler
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
+from transfer_queue.utils.storage_routing import group_by_storage_unit
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
@@ -555,6 +556,18 @@ class DataPartitionStatus:
             logger.error(f"Error updating production status for partition {self.partition_id}: {e}")
             return False
 
+    def validate_field_schema(self, field_schema: dict[str, dict[str, Any]]) -> None:
+        """Reject incompatible field types without changing metadata or readiness."""
+        for name, incoming in field_schema.items():
+            existing = self.field_metadata.get(name)
+            if existing is None:
+                continue
+            if bool(existing.is_non_tensor) != bool(incoming.get("is_non_tensor", False)):
+                raise ValueError(f"Field {name!r} tensor/non-tensor type mismatch")
+            dtype = incoming.get("dtype")
+            if dtype is not None and existing.dtype is not None and dtype != existing.dtype:
+                raise ValueError(f"Field {name!r} dtype mismatch: {existing.dtype} != {dtype}")
+
     def _update_field_metadata(
         self,
         global_indexes: list[int],
@@ -993,6 +1006,10 @@ class TransferQueueController:
 
         # Partition-GlobalIndex management
         self.index_manager = PartitionIndexManager()  # partition_id -> global_indexes
+        self._restore_lock = RLock()
+        self._restores: dict[str, dict[str, Any]] = {}
+        self._restore_outcomes: dict[str, bool] = {}
+        self._clearing_indexes: set[int] = set()
 
         # Connected storage managers tracking
         self._connected_storage_managers: set[str] = set()
@@ -1468,30 +1485,34 @@ class TransferQueueController:
             global_indexes: global indexes to mark as pending deletion
             partition_ids: corresponding partition IDs for each global index
         """
-        if global_indexes is None or partition_ids is None:
-            raise ValueError("global_indexes and partition_ids cannot be None")
+        with self._restore_lock:
+            if global_indexes is None or partition_ids is None:
+                raise ValueError("global_indexes and partition_ids cannot be None")
+            for pid in set(partition_ids):
+                self._assert_not_restoring(pid)
 
-        if len(global_indexes) != len(partition_ids):
-            raise ValueError(
-                f"global_indexes and partition_ids must have the same length, "
-                f"got {len(global_indexes)} and {len(partition_ids)}"
-            )
-
-        combined = list(zip(partition_ids, global_indexes, strict=True))
-        combined.sort(key=itemgetter(0))
-
-        for partition_id, group in groupby(combined, key=itemgetter(0)):
-            partition = self._get_partition(partition_id)
-            if not partition:
-                logger.info(
-                    f"[{self.controller_id}]: Trying to mark clearing in a non-existent partition {partition_id}. "
-                    f"Skipping operation for this partition."
+            if len(global_indexes) != len(partition_ids):
+                raise ValueError(
+                    f"global_indexes and partition_ids must have the same length, "
+                    f"got {len(global_indexes)} and {len(partition_ids)}"
                 )
-                continue
-            indexes = [idx for _, idx in group]
-            existing = list(set(indexes) & partition.global_indexes)
-            if existing and partition.production_status is not None:
-                partition.production_status[existing, :] = 0
+
+            combined = list(zip(partition_ids, global_indexes, strict=True))
+            combined.sort(key=itemgetter(0))
+
+            for partition_id, group in groupby(combined, key=itemgetter(0)):
+                partition = self._get_partition(partition_id)
+                if not partition:
+                    logger.info(
+                        f"[{self.controller_id}]: Trying to mark clearing in a non-existent partition {partition_id}. "
+                        f"Skipping operation for this partition."
+                    )
+                    continue
+                indexes = [idx for _, idx in group]
+                existing = list(set(indexes) & partition.global_indexes)
+                self._clearing_indexes.update(existing)
+                if existing and partition.production_status is not None:
+                    partition.production_status[existing, :] = 0
 
     def clear_partition(self, partition_id: str, clear_consumption: bool = True):
         """
@@ -1501,21 +1522,23 @@ class TransferQueueController:
             partition_id: ID of the partition to clear
             clear_consumption: Whether to also clear consumption status
         """
+        with self._restore_lock:
+            self._assert_not_restoring(partition_id)
+            logger.debug(f"[{self.controller_id}]: Clearing metadata in partition {partition_id}.")
 
-        logger.debug(f"[{self.controller_id}]: Clearing metadata in partition {partition_id}.")
+            partition = self._get_partition(partition_id)
+            if not partition:
+                logger.warning(
+                    f"[{self.controller_id}]: Trying to clear a non-existent partition {partition_id}. No action taken."
+                )
+                return
 
-        partition = self._get_partition(partition_id)
-        if not partition:
-            logger.warning(
-                f"[{self.controller_id}]: Trying to clear a non-existent partition {partition_id}. No action taken."
-            )
-            return
-
-        global_indexes_range = list(self.index_manager.get_indexes_for_partition(partition_id))
-        partition.clear_data(global_indexes_range, clear_consumption)
-        self.index_manager.release_partition(partition_id)
-        self.partitions.pop(partition_id)
-        self.sampler.clear_cache(partition_id)
+            global_indexes_range = list(self.index_manager.get_indexes_for_partition(partition_id))
+            partition.clear_data(global_indexes_range, clear_consumption)
+            self.index_manager.release_partition(partition_id)
+            self._clearing_indexes.difference_update(global_indexes_range)
+            self.partitions.pop(partition_id)
+            self.sampler.clear_cache(partition_id)
 
     def reset_consumption(self, partition_id: str, task_name: str | None = None):
         """
@@ -1552,54 +1575,57 @@ class TransferQueueController:
             partition_ids: IDs of the partitions to clear
             clear_consumption: Whether to also clear consumption status
         """
-
-        logger.debug(
-            f"[{self.controller_id}]: Clearing meta with global_indexes {global_indexes} in partition {partition_ids}"
-        )
-
-        if global_indexes is None or partition_ids is None:
-            raise ValueError("global_indexes and partition_ids cannot be None")
-
-        if len(global_indexes) != len(partition_ids):
-            raise ValueError(
-                f"global_indexes and partition_ids must have the same length, "
-                f"got {len(global_indexes)} and {len(partition_ids)}"
+        with self._restore_lock:
+            logger.debug(
+                "[%s]: Clearing indexes %s in partitions %s", self.controller_id, global_indexes, partition_ids
             )
 
-        combined = list(zip(partition_ids, global_indexes, strict=True))
-        combined.sort(key=itemgetter(0))
+            if global_indexes is None or partition_ids is None:
+                raise ValueError("global_indexes and partition_ids cannot be None")
+            for pid in set(partition_ids):
+                self._assert_not_restoring(pid)
 
-        for partition_id, group in groupby(combined, key=itemgetter(0)):
-            partition = self._get_partition(partition_id)
-            if not partition:
-                logger.info(
-                    f"[{self.controller_id}]: Trying to clear data in a non-existent partition {partition_id}. "
-                    f"Skipping operation for this partition."
-                )
-                continue
-
-            global_indexes_to_clear = [idx for _, idx in group]
-            existing_global_indexes = partition.global_indexes
-            non_existent_global_indexes = set(global_indexes_to_clear) - existing_global_indexes
-            if non_existent_global_indexes:
-                logger.info(
-                    f"[{self.controller_id}]: Some global_indexes to be cleared do not exist in "
-                    f"partition {partition_id}: {non_existent_global_indexes}. They will be ignored."
+            if len(global_indexes) != len(partition_ids):
+                raise ValueError(
+                    f"global_indexes and partition_ids must have the same length, "
+                    f"got {len(global_indexes)} and {len(partition_ids)}"
                 )
 
-            global_indexes_to_clear = list(set(global_indexes_to_clear) & existing_global_indexes)
-            if not global_indexes_to_clear:
-                logger.info(
-                    f"[{self.controller_id}]: No existing global indexes to clear in partition {partition_id}. "
-                    f"Skipping operation for this partition."
-                )
-                continue
+            combined = list(zip(partition_ids, global_indexes, strict=True))
+            combined.sort(key=itemgetter(0))
 
-            # Clear data from partition
-            partition.clear_data(global_indexes_to_clear, clear_consumption)
+            for partition_id, group in groupby(combined, key=itemgetter(0)):
+                partition = self._get_partition(partition_id)
+                if not partition:
+                    logger.info(
+                        f"[{self.controller_id}]: Trying to clear data in a non-existent partition {partition_id}. "
+                        f"Skipping operation for this partition."
+                    )
+                    continue
 
-            # Release the specific indexes from index manager
-            self.index_manager.release_indexes(partition_id, global_indexes_to_clear)
+                global_indexes_to_clear = [idx for _, idx in group]
+                existing_global_indexes = partition.global_indexes
+                non_existent_global_indexes = set(global_indexes_to_clear) - existing_global_indexes
+                if non_existent_global_indexes:
+                    logger.info(
+                        f"[{self.controller_id}]: Some global_indexes to be cleared do not exist in "
+                        f"partition {partition_id}: {non_existent_global_indexes}. They will be ignored."
+                    )
+
+                global_indexes_to_clear = list(set(global_indexes_to_clear) & existing_global_indexes)
+                if not global_indexes_to_clear:
+                    logger.info(
+                        f"[{self.controller_id}]: No existing global indexes to clear in partition {partition_id}. "
+                        f"Skipping operation for this partition."
+                    )
+                    continue
+
+                # Clear data from partition
+                partition.clear_data(global_indexes_to_clear, clear_consumption)
+
+                # Release the specific indexes from index manager
+                self.index_manager.release_indexes(partition_id, global_indexes_to_clear)
+                self._clearing_indexes.difference_update(global_indexes_to_clear)
 
     def kv_retrieve_meta(
         self,
@@ -1619,64 +1645,66 @@ class TransferQueueController:
         Returns:
             metadata: BatchMeta of the requested keys
         """
+        with self._restore_lock:
+            if create:
+                self._assert_not_restoring(partition_id)
+            logger.debug(f"[{self.controller_id}] Retrieve keys {keys} in partition {partition_id}")
 
-        logger.debug(f"[{self.controller_id}] Retrieve keys {keys} in partition {partition_id}")
-
-        # Ensure partition exists
-        partition = self._get_partition(partition_id)
-        if partition is None:
-            if not create:
-                logger.warning(
-                    f"[{self.controller_id}]: Partition {partition_id} not found. Returning empty BatchMeta."
-                )
-                return BatchMeta.empty()
-
-            self.create_partition(partition_id)
+            # Ensure partition exists
             partition = self._get_partition(partition_id)
-
-        assert partition is not None
-        global_indexes = partition.kv_retrieve_indexes(keys)
-
-        none_indexes = [idx for idx, value in enumerate(global_indexes) if value is None]
-        if len(none_indexes) > 0:
-            if not create:
-                logger.warning(
-                    f"Keys {[keys[i] for i in none_indexes]} were not found in partition {partition_id}. "
-                    f"They will be excluded from the retrieved BatchMeta."
-                )
-            else:
-                # create non-exist keys
-                batch_global_indexes = partition.activate_pre_allocated_indexes(len(none_indexes))
-
-                if len(batch_global_indexes) < len(none_indexes):
-                    new_global_indexes = self.index_manager.allocate_indexes(
-                        partition_id, count=(len(none_indexes) - len(batch_global_indexes))
+            if partition is None:
+                if not create:
+                    logger.warning(
+                        f"[{self.controller_id}]: Partition {partition_id} not found. Returning empty BatchMeta."
                     )
-                    batch_global_indexes.extend(new_global_indexes)
+                    return BatchMeta.empty()
 
-                # register global_indexes in partition
-                partition.global_indexes.update(batch_global_indexes)
+                self.create_partition(partition_id)
+                partition = self._get_partition(partition_id)
 
-                # register key-global_indexes mapping in partition
-                for i in range(len(none_indexes)):
-                    global_indexes[none_indexes[i]] = batch_global_indexes[i]
-                    partition.keys_mapping[keys[none_indexes[i]]] = batch_global_indexes[i]
-                    partition.revert_keys_mapping[batch_global_indexes[i]] = keys[none_indexes[i]]
+            assert partition is not None
+            global_indexes = partition.kv_retrieve_indexes(keys)
 
-                partition.ensure_samples_capacity(max(batch_global_indexes) + 1)
+            none_indexes = [idx for idx, value in enumerate(global_indexes) if value is None]
+            if len(none_indexes) > 0:
+                if not create:
+                    logger.warning(
+                        f"Keys {[keys[i] for i in none_indexes]} were not found in partition {partition_id}. "
+                        f"They will be excluded from the retrieved BatchMeta."
+                    )
+                else:
+                    # create non-exist keys
+                    batch_global_indexes = partition.activate_pre_allocated_indexes(len(none_indexes))
 
-        verified_global_indexes = [idx for idx in global_indexes if idx is not None]
+                    if len(batch_global_indexes) < len(none_indexes):
+                        new_global_indexes = self.index_manager.allocate_indexes(
+                            partition_id, count=(len(none_indexes) - len(batch_global_indexes))
+                        )
+                        batch_global_indexes.extend(new_global_indexes)
 
-        # must fetch fields that the requested samples all have
-        col_mask = partition.production_status[verified_global_indexes, :].sum(dim=0).reshape(-1) == len(
-            verified_global_indexes
-        )
-        data_fields = []
-        for field_name, col_idx in partition.field_name_mapping.items():
-            if col_idx < len(col_mask) and col_mask[col_idx]:
-                data_fields.append(field_name)
+                    # register global_indexes in partition
+                    partition.global_indexes.update(batch_global_indexes)
 
-        return self.generate_batch_meta(partition_id, verified_global_indexes, data_fields, mode="force_fetch")
+                    # register key-global_indexes mapping in partition
+                    for i in range(len(none_indexes)):
+                        global_indexes[none_indexes[i]] = batch_global_indexes[i]
+                        partition.keys_mapping[keys[none_indexes[i]]] = batch_global_indexes[i]
+                        partition.revert_keys_mapping[batch_global_indexes[i]] = keys[none_indexes[i]]
+
+                    partition.ensure_samples_capacity(max(batch_global_indexes) + 1)
+
+            verified_global_indexes = [idx for idx in global_indexes if idx is not None]
+
+            # must fetch fields that the requested samples all have
+            col_mask = partition.production_status[verified_global_indexes, :].sum(dim=0).reshape(-1) == len(
+                verified_global_indexes
+            )
+            data_fields = []
+            for field_name, col_idx in partition.field_name_mapping.items():
+                if col_idx < len(col_mask) and col_mask[col_idx]:
+                    data_fields.append(field_name)
+
+            return self.generate_batch_meta(partition_id, verified_global_indexes, data_fields, mode="force_fetch")
 
     def kv_retrieve_keys(
         self,
@@ -1713,6 +1741,150 @@ class TransferQueueController:
             return []
 
         return keys
+
+    # ==================== Selective Data Dump API ====================
+
+    def describe_rows_by_key(self, partition_id: str, keys: list[str]) -> dict[str, dict[str, Any]]:
+        """Describe the key-addressed rows a selective dump needs, without copying them.
+
+        Returns only metadata, so the caller can write a row index and route the payload
+        dump to the storage units that hold it. Deliberately avoids ``to_snapshot``: a
+        dump needs a handful of lookups per key, not a deep copy of the whole partition.
+
+        Args:
+            partition_id: Partition that owns ``keys``.
+            keys: Keys to describe, already deduplicated by the caller.
+
+        Returns:
+            ``{key: {"global_index": int, "fields": list[str], "tag": dict}}``. ``fields``
+            is empty for a row that exists in metadata but has no produced field yet.
+
+        Raises:
+            KeyError: The partition or any key does not exist.
+        """
+        partition = self._get_partition(partition_id)
+        if partition is None:
+            raise KeyError(f"partition {partition_id!r} does not exist; existing partitions: {sorted(self.partitions)}")
+
+        global_indexes = partition.kv_retrieve_indexes(keys)
+        missing_keys = [key for key, index in zip(keys, global_indexes, strict=True) if index is None]
+        if missing_keys:
+            raise KeyError(f"keys not found in partition {partition_id!r}: {missing_keys}")
+
+        return {
+            key: {
+                "global_index": global_index,
+                "fields": sorted(
+                    field_name
+                    for field_name, field_meta in partition.field_metadata.items()
+                    if global_index in field_meta.global_indexes
+                ),
+                "tag": partition.custom_meta.get(global_index, {}),
+            }
+            for key, global_index in zip(keys, cast(list[int], global_indexes), strict=True)
+        }
+
+    def _assert_not_restoring(self, partition_id: str | None = None) -> None:
+        for restore_id, restore in self._restores.items():
+            if partition_id is None or restore["partition_id"] == partition_id:
+                raise RuntimeError(
+                    f"Restore {restore_id} is unresolved; recover_data_load({restore['dump_dir']!r}) first"
+                )
+
+    def begin_restore(
+        self, restore_id: str, dump_dir: str, partition_id: str, rows: dict, units: list[str], schema: dict
+    ):
+        """Reserve a destination partition until every possible remote writer is settled."""
+        with self._restore_lock:
+            if restore_id in self._restore_outcomes:
+                raise RuntimeError("Restore was already committed or cancelled")
+            if restore_id in self._restores:
+                return self._restores[restore_id]["metadata"]
+            self._assert_not_restoring(partition_id)
+            partition = self._get_partition(partition_id)
+            if partition is not None:
+                if partition.global_indexes & self._clearing_indexes:
+                    raise RuntimeError("Partition has an unfinished clear; complete it before restoring")
+                partition.validate_field_schema(schema)
+            keys = list(rows)
+            metadata = self.kv_retrieve_meta(keys, partition_id, create=True)
+            data_indexes = [
+                index for key, index in zip(keys, metadata.global_indexes, strict=True) if rows[key]["fields"]
+            ]
+            active_units = group_by_storage_unit(data_indexes, units)
+            metadata.update_custom_meta([rows[key]["tag"] for key in keys])
+            self._restores[restore_id] = {
+                "partition_id": partition_id,
+                "dump_dir": dump_dir,
+                "metadata": metadata,
+                "units": {unit: "pending" for unit in active_units},
+                "updates": {},
+                "aborting": False,
+            }
+            return metadata
+
+    def restore_unit(self, restore_id: str, unit_id: str, action: str, result: dict | None = None) -> None:
+        """Grant one execution and record its terminal result; unknown IDs never grant writes."""
+        with self._restore_lock:
+            restore = self._restores.get(restore_id)
+            if restore_id in self._restore_outcomes and action == "complete":
+                return
+            if restore is None or unit_id not in restore["units"]:
+                raise RuntimeError("Restore is no longer active")
+            state = restore["units"][unit_id]
+            if action == "claim":
+                if state != "pending" or restore["aborting"]:
+                    raise RuntimeError(f"Restore unit cannot start in state {state}")
+                restore["units"][unit_id] = "running"
+            elif action == "complete" and state in ("running", "done", "failed") and result is not None:
+                restore["units"][unit_id] = "done" if result["success"] else "failed"
+                restore["updates"][unit_id] = result.get("updates", [])
+            else:
+                raise RuntimeError(f"Invalid restore transition {state} -> {action}")
+
+    def finish_restore(self, restore_id: str, commit: bool) -> dict:
+        """Settle a restore after its workers terminate, retaining the outcome for lost replies."""
+        with self._restore_lock:
+            if restore_id in self._restore_outcomes:
+                return {"finished": True, "committed": self._restore_outcomes[restore_id]}
+            restore = self._restores.get(restore_id)
+            if restore is None:
+                if commit:
+                    return {"finished": False}
+                self._restore_outcomes[restore_id] = False
+                return {"finished": True, "committed": False}
+            if not commit or "failed" in restore["units"].values():
+                restore["aborting"] = True
+                for unit, state in restore["units"].items():
+                    if state == "pending":
+                        restore["units"][unit] = "cancelled"
+            running = [unit for unit, state in restore["units"].items() if state in ("pending", "running")]
+            if running:
+                return {"finished": False, "units": running}
+            committed = commit and not restore["aborting"]
+            if committed:
+                partition = self.partitions[restore["partition_id"]]
+                updates = [update for group in restore["updates"].values() for update in group]
+                for update in updates:
+                    partition.validate_field_schema(update["field_schema"])
+                for update in updates:
+                    if not partition.update_production_status(update["global_indexes"], [], update["field_schema"]):
+                        raise RuntimeError("Controller rejected restored metadata")
+                metadata = restore["metadata"]
+                partition.set_custom_meta(dict(zip(metadata.global_indexes, metadata.custom_meta, strict=True)))
+            # Retain only the terminal outcome, never payloads or per-row metadata.
+            self._restore_outcomes[restore_id] = committed
+            del self._restores[restore_id]
+            return {"finished": True, "committed": committed}
+
+    def list_restores(self, dump_dir: str | None) -> list[str]:
+        """Find unfinished operations for a dump, including after the initiating client exits."""
+        with self._restore_lock:
+            return [
+                restore_id
+                for restore_id, restore in self._restores.items()
+                if dump_dir is None or restore["dump_dir"] == dump_dir
+            ]
 
     def _init_zmq_socket(self):
         """Initialize ZMQ sockets for communication."""
@@ -2195,6 +2367,30 @@ class TransferQueueController:
                     body={"partition_info": partition_info, "message": message},
                 )
 
+        elif request_msg.request_type == ZMQRequestType.DESCRIBE_ROWS_BY_KEY:
+            with monitor.measure(op_type="DESCRIBE_ROWS_BY_KEY"):
+                response_msg = self._handle_describe_rows_by_key_request(request_msg)
+
+        elif request_msg.request_type == ZMQRequestType.VALIDATE_DUMP_SCHEMA:
+            with monitor.measure(op_type="VALIDATE_DUMP_SCHEMA"):
+                response_msg = self._handle_validate_dump_schema_request(request_msg)
+
+        elif request_msg.request_type == ZMQRequestType.BEGIN_RESTORE:
+            with monitor.measure(op_type="BEGIN_RESTORE"):
+                response_msg = self._handle_begin_restore_request(request_msg)
+
+        elif request_msg.request_type == ZMQRequestType.RESTORE_UNIT:
+            with monitor.measure(op_type="RESTORE_UNIT"):
+                response_msg = self._handle_restore_unit_request(request_msg)
+
+        elif request_msg.request_type == ZMQRequestType.FINISH_RESTORE:
+            with monitor.measure(op_type="FINISH_RESTORE"):
+                response_msg = self._handle_finish_restore_request(request_msg)
+
+        elif request_msg.request_type == ZMQRequestType.LIST_RESTORES:
+            with monitor.measure(op_type="LIST_RESTORES"):
+                response_msg = self._handle_list_restores_request(request_msg)
+
         elif request_msg.request_type == ZMQRequestType.SAVE_CONTROLLER_CHECKPOINT:
             path = request_msg.body["path"]
             self.save_checkpoint(path)
@@ -2216,6 +2412,62 @@ class TransferQueueController:
             )
 
         return response_msg
+
+    def _make_response(
+        self,
+        request_msg: ZMQMessage,
+        response_type: ZMQRequestType,
+        body: dict[str, Any],
+    ) -> ZMQMessage:
+        """Build a controller response addressed to the request sender."""
+        return ZMQMessage.create(
+            request_type=response_type,
+            sender_id=self.controller_id,
+            receiver_id=request_msg.sender_id,
+            body=body,
+        )
+
+    def _handle_describe_rows_by_key_request(self, request_msg: ZMQMessage) -> ZMQMessage:
+        params = request_msg.body
+        rows = self.describe_rows_by_key(params["partition_id"], params["keys"])
+        partition = self.partitions[params["partition_id"]]
+        field_schema = {}
+        for name, meta in partition.field_metadata.items():
+            indexes = [row["global_index"] for row in rows.values() if name in row["fields"]]
+            if not indexes:
+                continue
+            schema = meta.to_batch_schema(indexes)
+            if schema.get("is_nested"):
+                schema["per_sample_shapes"] = {index: meta.per_sample_shapes[index] for index in indexes}
+            field_schema[name] = schema
+        return self._make_response(
+            request_msg,
+            ZMQRequestType.DESCRIBE_ROWS_BY_KEY_RESPONSE,
+            {"success": True, "partition_id": params["partition_id"], "rows": rows, "field_schema": field_schema},
+        )
+
+    def _handle_begin_restore_request(self, request_msg: ZMQMessage) -> ZMQMessage:
+        metadata = self.begin_restore(**request_msg.body)
+        return self._make_response(request_msg, ZMQRequestType.BEGIN_RESTORE_RESPONSE, {"metadata": metadata})
+
+    def _handle_restore_unit_request(self, request_msg: ZMQMessage) -> ZMQMessage:
+        self.restore_unit(**request_msg.body)
+        return self._make_response(request_msg, ZMQRequestType.RESTORE_UNIT_RESPONSE, {"success": True})
+
+    def _handle_finish_restore_request(self, request_msg: ZMQMessage) -> ZMQMessage:
+        result = self.finish_restore(**request_msg.body)
+        return self._make_response(request_msg, ZMQRequestType.FINISH_RESTORE_RESPONSE, result)
+
+    def _handle_list_restores_request(self, request_msg: ZMQMessage) -> ZMQMessage:
+        ids = self.list_restores(request_msg.body["dump_dir"])
+        return self._make_response(request_msg, ZMQRequestType.LIST_RESTORES_RESPONSE, {"restore_ids": ids})
+
+    def _handle_validate_dump_schema_request(self, request_msg: ZMQMessage) -> ZMQMessage:
+        params = request_msg.body
+        partition = self._get_partition(params["partition_id"])
+        if partition is not None:
+            partition.validate_field_schema(params["field_schema"])
+        return self._make_response(request_msg, ZMQRequestType.VALIDATE_DUMP_SCHEMA_RESPONSE, {"success": True})
 
     def get_zmq_server_info(self) -> ZMQServerInfo:
         """Get ZMQ server connection information."""
@@ -2241,23 +2493,25 @@ class TransferQueueController:
         Raises:
             Exception: If serialization or file I/O fails.
         """
-        try:
-            state = {
-                "controller_id": self.controller_id,
-                "partitions": {pid: p.to_snapshot() for pid, p in self.partitions.items()},
-                "index_manager": {
-                    "partition_to_indexes": dict(copy.deepcopy(self.index_manager.partition_to_indexes)),
-                    "reusable_indexes": list(self.index_manager.reusable_indexes),
-                    "global_index_counter": self.index_manager.global_index_counter,
-                    "allocated_indexes": set(self.index_manager.allocated_indexes),
-                },
-                "sampler": self.sampler.save_checkpoint(),
-            }
-            with open(path, "wb") as f:
-                pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
-            logger.info(f"[{self.controller_id}]: dumped to {path}")
-        except Exception as e:
-            raise RuntimeError(f"[{self.controller_id}]: save checkpoint failed: {e}") from e
+        with self._restore_lock:
+            self._assert_not_restoring()
+            try:
+                state = {
+                    "controller_id": self.controller_id,
+                    "partitions": {pid: p.to_snapshot() for pid, p in self.partitions.items()},
+                    "index_manager": {
+                        "partition_to_indexes": dict(copy.deepcopy(self.index_manager.partition_to_indexes)),
+                        "reusable_indexes": list(self.index_manager.reusable_indexes),
+                        "global_index_counter": self.index_manager.global_index_counter,
+                        "allocated_indexes": set(self.index_manager.allocated_indexes),
+                    },
+                    "sampler": self.sampler.save_checkpoint(),
+                }
+                with open(path, "wb") as f:
+                    pickle.dump(state, f, protocol=pickle.HIGHEST_PROTOCOL)
+                logger.info(f"[{self.controller_id}]: dumped to {path}")
+            except Exception as e:
+                raise RuntimeError(f"[{self.controller_id}]: save checkpoint failed: {e}") from e
 
     def load_checkpoint(self, path: str) -> None:
         """Restore controller state directly from a file.
@@ -2268,24 +2522,27 @@ class TransferQueueController:
         Raises:
             Exception: If deserialization or file I/O fails.
         """
-        try:
-            with open(path, "rb") as f:
-                state = pickle.load(f)
+        with self._restore_lock:
+            self._assert_not_restoring()
+            try:
+                with open(path, "rb") as f:
+                    state = pickle.load(f)
 
-            self.controller_id = state["controller_id"]
-            self.partitions = state["partitions"]
+                self.controller_id = state["controller_id"]
+                self.partitions = state["partitions"]
+                self._clearing_indexes.clear()
 
-            im = state["index_manager"]
-            self.index_manager.partition_to_indexes = defaultdict(set, im["partition_to_indexes"])
-            self.index_manager.reusable_indexes = im["reusable_indexes"]
-            self.index_manager.global_index_counter = im["global_index_counter"]
-            self.index_manager.allocated_indexes = im["allocated_indexes"]
+                im = state["index_manager"]
+                self.index_manager.partition_to_indexes = defaultdict(set, im["partition_to_indexes"])
+                self.index_manager.reusable_indexes = im["reusable_indexes"]
+                self.index_manager.global_index_counter = im["global_index_counter"]
+                self.index_manager.allocated_indexes = im["allocated_indexes"]
 
-            self.sampler.load_checkpoint(state["sampler"])
+                self.sampler.load_checkpoint(state["sampler"])
 
-            logger.info(f"[{self.controller_id}]: restored from {path}")
-        except Exception as e:
-            raise RuntimeError(f"[{self.controller_id}]: load checkpoint failed: {e}") from e
+                logger.info(f"[{self.controller_id}]: restored from {path}")
+            except Exception as e:
+                raise RuntimeError(f"[{self.controller_id}]: load checkpoint failed: {e}") from e
 
     def register_sampler(
         self,
