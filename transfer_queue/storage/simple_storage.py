@@ -17,7 +17,6 @@ import os
 import pickle
 import time
 import weakref
-from collections import defaultdict
 from threading import Event, Thread
 from typing import TYPE_CHECKING, Any
 from uuid import uuid4
@@ -25,11 +24,7 @@ from uuid import uuid4
 import psutil
 import ray
 import zmq
-from tensordict import TensorDict
 
-from transfer_queue.metadata import extract_field_schema
-from transfer_queue.storage.dump_io import read_dump_row, select_dump_schema, validate_dump_values
-from transfer_queue.utils import compact_pickle
 from transfer_queue.utils.common import (
     estimate_payload_bytes,
     get_env_bool,
@@ -38,7 +33,6 @@ from transfer_queue.utils.common import (
 from transfer_queue.utils.enum_utils import Role
 from transfer_queue.utils.logging_utils import get_logger
 from transfer_queue.utils.perf_utils import IntervalPerfMonitor
-from transfer_queue.utils.tensor_utils import pack_field_values
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
@@ -222,7 +216,6 @@ class SimpleStorageUnit:
         self.proxy_thread: Thread | None = None
         self.worker_thread: Thread | None = None
 
-        self._restore_results: dict[str, dict] = {}
         self._metrics: TQMetricsExporter | None = None
 
         self._init_zmq_socket()
@@ -446,14 +439,6 @@ class SimpleStorageUnit:
                         response_msg = self._handle_get_metrics()
                     elif operation == ZMQRequestType.SAVE_STORAGE_CHECKPOINT:  # type: ignore[arg-type]
                         response_msg = self._handle_save_checkpoint(request_msg)
-                    elif operation == ZMQRequestType.DUMP_ROWS:  # type: ignore[arg-type]
-                        with monitor.measure(op_type="DUMP_ROWS"):
-                            response_msg = self._handle_dump_rows(request_msg)
-                    elif operation == ZMQRequestType.LOAD_ROWS:  # type: ignore[arg-type]
-                        with monitor.measure(op_type="LOAD_ROWS"):
-                            response_msg = self._handle_load_rows(request_msg)
-                    elif operation == ZMQRequestType.REPORT_RESTORE:
-                        response_msg = self._handle_report_restore(request_msg)
                     elif operation == ZMQRequestType.LOAD_STORAGE_CHECKPOINT:  # type: ignore[arg-type]
                         response_msg = self._handle_load_checkpoint(request_msg)
                     else:
@@ -704,7 +689,7 @@ class SimpleStorageUnit:
         # Include per-operation stats if Prometheus metrics are enabled
         if self._metrics is not None:
             op_stats = {}
-            for op_type in ("PUT_DATA", "GET_DATA", "CLEAR_DATA", "DUMP_ROWS", "LOAD_ROWS"):
+            for op_type in ("PUT_DATA", "GET_DATA", "CLEAR_DATA"):
                 try:
                     hist = self._metrics.request_duration.labels(op_type=op_type)
                     counter = self._metrics.request_total.labels(op_type=op_type)
@@ -762,182 +747,6 @@ class SimpleStorageUnit:
             logger.error(f"[{self.storage_unit_id}]: save checkpoint failed: {e}")
             return ZMQMessage.create(
                 request_type=ZMQRequestType.SAVE_STORAGE_CHECKPOINT_RESPONSE,  # type: ignore[arg-type]
-                sender_id=self.storage_unit_id,
-                body={"success": False, "message": str(e)},
-            )
-
-    def _handle_dump_rows(self, request: ZMQMessage) -> ZMQMessage:
-        """Write independent row records and return their offsets, never their payloads."""
-        path = request.body["path"]
-        indexes = set(request.body["global_indexes"])
-        try:
-            missing = indexes - self.storage_data._active_keys
-            if missing:
-                raise ValueError(f"Storage holds no data for requested rows: {sorted(missing)[:20]}")
-            row_offsets = {}
-            with open(path, "wb") as f:
-                for index in sorted(indexes):
-                    described_fields = request.body.get("fields_by_index")
-                    if described_fields is None:
-                        fields = {
-                            name: values[index]
-                            for name, values in self.storage_data.field_data.items()
-                            if index in values
-                        }
-                    else:
-                        # Reused global indexes can retain fields no longer present in metadata.
-                        fields = {name: self.storage_data.field_data[name][index] for name in described_fields[index]}
-                    offset = f.tell()
-                    compact_pickle.dump({"global_index": index, "fields": fields}, f)
-                    row_offsets[index] = [offset, f.tell() - offset]
-                f.flush()
-                os.fsync(f.fileno())
-            logger.info("[%s]: dumped %s rows to %s", self.storage_unit_id, len(indexes), path)
-            return ZMQMessage.create(
-                request_type=ZMQRequestType.DUMP_ROWS_RESPONSE,
-                sender_id=self.storage_unit_id,
-                body={"success": True, "dumped_rows": len(indexes), "missing_rows": [], "row_offsets": row_offsets},
-            )
-        except Exception as e:
-            logger.error("[%s]: dump rows failed: %s", self.storage_unit_id, e)
-            return ZMQMessage.create(
-                request_type=ZMQRequestType.DUMP_ROWS_RESPONSE,
-                sender_id=self.storage_unit_id,
-                body={"success": False, "message": str(e)},
-            )
-
-    def _restore_controller_request(self, context: dict, action: str, result: dict | None = None) -> None:
-        socket = create_zmq_socket(self.zmq_context, zmq.DEALER, context["controller_ip"])
-        try:
-            socket.setsockopt(zmq.RCVTIMEO, 10000)
-            socket.setsockopt(zmq.SNDTIMEO, 10000)
-            socket.connect(context["controller_address"])
-            request = ZMQMessage.create(
-                request_type=ZMQRequestType.RESTORE_UNIT,
-                sender_id=self.storage_unit_id,
-                body={
-                    "restore_id": context["restore_id"],
-                    "unit_id": self.storage_unit_id,
-                    "action": action,
-                    "result": result,
-                },
-            )
-            socket.send_multipart(request.serialize())
-            response = ZMQMessage.deserialize(socket.recv_multipart())
-            if response.request_type != ZMQRequestType.RESTORE_UNIT_RESPONSE:
-                raise RuntimeError(response.body.get("message", "Restore permission rejected"))
-        finally:
-            socket.close(linger=0)
-
-    def _handle_report_restore(self, request: ZMQMessage) -> ZMQMessage:
-        context = request.body
-        result = self._restore_results.get(context["restore_id"])
-        try:
-            if result is not None:
-                self._restore_controller_request(context, "complete", result)
-                self._restore_results.pop(context["restore_id"], None)
-            return ZMQMessage.create(
-                request_type=ZMQRequestType.REPORT_RESTORE_RESPONSE,
-                sender_id=self.storage_unit_id,
-                body={"success": True},
-            )
-        except Exception as e:
-            return ZMQMessage.create(
-                request_type=ZMQRequestType.REPORT_RESTORE_RESPONSE,
-                sender_id=self.storage_unit_id,
-                body={"success": False, "message": str(e)},
-            )
-
-    def _handle_load_rows(self, request: ZMQMessage) -> ZMQMessage:
-        """Claim permission before touching storage; report completion independently of the caller."""
-        context = request.body.get("restore")
-        if context is None:
-            return ZMQMessage.create(
-                request_type=ZMQRequestType.LOAD_ROWS_RESPONSE,
-                sender_id=self.storage_unit_id,
-                body={"success": False, "message": "Missing restore reservation"},
-            )
-        try:
-            self._restore_controller_request(context, "claim")
-        except zmq.error.Again as e:
-            # A lost claim ACK may leave the controller in running state even though
-            # this worker will not write; retain a terminal result for recovery.
-            self._restore_results[context["restore_id"]] = {"success": False, "message": str(e)}
-            return ZMQMessage.create(
-                request_type=ZMQRequestType.LOAD_ROWS_RESPONSE,
-                sender_id=self.storage_unit_id,
-                body={"success": False, "message": "Restore claim outcome unknown"},
-            )
-        except Exception as e:
-            return ZMQMessage.create(
-                request_type=ZMQRequestType.LOAD_ROWS_RESPONSE,
-                sender_id=self.storage_unit_id,
-                body={"success": False, "message": str(e)},
-            )
-        response = self._load_rows(request)
-        self._restore_results[context["restore_id"]] = response.body
-        try:
-            self._restore_controller_request(context, "complete", response.body)
-            self._restore_results.pop(context["restore_id"], None)
-        except Exception as e:
-            logger.warning("[%s]: restore result retained for recovery: %s", self.storage_unit_id, e)
-        return response
-
-    def _load_rows(self, request: ZMQMessage) -> ZMQMessage:
-        """Seek to assigned records and merge them into local storage at current indexes."""
-        updates = []
-        bytes_read = 0
-        try:
-            with limit_pytorch_auto_parallel_threads(TQ_NUM_THREADS):
-                for shard in request.body["shards"]:
-                    records = sorted(shard["records"], key=lambda row: row["offset"])
-                    with open(shard["path"], "rb", buffering=0) as f:
-                        # Bound temporary payload memory while retaining batched schema updates.
-                        for start in range(0, len(records), 128):
-                            groups = defaultdict(list)
-                            for row in records[start : start + 128]:
-                                fields = read_dump_row(
-                                    f, row["offset"], row["length"], row["source_index"], row["fields"]
-                                )
-                                if "field_schema" in shard:
-                                    validate_dump_values(fields, shard["field_schema"], row["source_index"])
-                                groups[tuple(row["fields"])].append((row, fields))
-                                bytes_read += row["length"]
-                            for signature, rows in groups.items():
-                                indexes = [row["target_index"] for row, _ in rows]
-                                values = {name: [fields[name] for _, fields in rows] for name in signature}
-                                if "field_schema" in shard:
-                                    schema = select_dump_schema(
-                                        shard["field_schema"],
-                                        [row["source_index"] for row, _ in rows],
-                                        indexes,
-                                        signature,
-                                    )
-                                else:
-                                    packed = {name: pack_field_values(items) for name, items in values.items()}
-                                    schema = extract_field_schema(TensorDict(packed, batch_size=len(rows)))
-                                    for field in schema.values():
-                                        if "per_sample_shapes" in field:
-                                            field["per_sample_shapes"] = dict(
-                                                zip(indexes, field["per_sample_shapes"], strict=True)
-                                            )
-                                self.storage_data.put_data(values, indexes)
-                                updates.append({"global_indexes": indexes, "field_schema": schema})
-            logger.info(
-                "[%s]: loaded %s rows (%s bytes)",
-                self.storage_unit_id,
-                sum(len(update["global_indexes"]) for update in updates),
-                bytes_read,
-            )
-            return ZMQMessage.create(
-                request_type=ZMQRequestType.LOAD_ROWS_RESPONSE,
-                sender_id=self.storage_unit_id,
-                body={"success": True, "updates": updates, "bytes_read": bytes_read},
-            )
-        except Exception as e:
-            logger.error("[%s]: load rows failed: %s", self.storage_unit_id, e)
-            return ZMQMessage.create(
-                request_type=ZMQRequestType.LOAD_ROWS_RESPONSE,
                 sender_id=self.storage_unit_id,
                 body={"success": False, "message": str(e)},
             )

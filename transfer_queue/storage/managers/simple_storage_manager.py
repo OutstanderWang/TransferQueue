@@ -23,7 +23,7 @@ from collections.abc import Mapping
 from functools import partial
 from operator import itemgetter
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, NamedTuple
 
 import torch
 import zmq
@@ -34,8 +34,6 @@ from transfer_queue.metadata import BatchMeta, extract_field_schema
 from transfer_queue.storage.managers.base import StorageManager, StorageManagerFactory
 from transfer_queue.utils.common import estimate_payload_bytes
 from transfer_queue.utils.logging_utils import get_logger
-from transfer_queue.utils.storage_routing import RoutingGroup, group_by_storage_unit
-from transfer_queue.utils.tensor_utils import pack_field_values
 from transfer_queue.utils.zmq_utils import (
     ZMQMessage,
     ZMQRequestType,
@@ -121,6 +119,13 @@ with_storage_unit_probe_socket = with_zmq_socket(
 )
 
 
+class RoutingGroup(NamedTuple):
+    """Routing result for a single storage unit."""
+
+    global_indexes: list[int]  # global indexes routed to this SU
+    batch_positions: list[int]  # corresponding positions in the original batch
+
+
 @StorageManagerFactory.register("SimpleStorage")
 class AsyncSimpleStorageManager(StorageManager):
     """Asynchronous storage manager that handles multiple storage units.
@@ -190,7 +195,15 @@ class AsyncSimpleStorageManager(StorageManager):
 
         NOTE: Dynamic SU scaling requires a data migration mechanism (not yet supported).
         """
-        return group_by_storage_unit(global_indexes, list(self.storage_unit_infos))
+        storage_unit_keys = list(self.storage_unit_infos.keys())
+        num_units = len(storage_unit_keys)
+        gi_lists: dict[str, list[int]] = defaultdict(list)
+        pos_lists: dict[str, list[int]] = defaultdict(list)
+        for pos, global_idx in enumerate(global_indexes):
+            key = storage_unit_keys[global_idx % num_units]
+            gi_lists[key].append(global_idx)
+            pos_lists[key].append(pos)
+        return {key: RoutingGroup(gi_lists[key], pos_lists[key]) for key in gi_lists}
 
     def _describe_storage_unit(self, storage_unit_id: str) -> str:
         """Return ``ip:port`` for a storage unit, for use in diagnostics.
@@ -484,7 +497,55 @@ class AsyncSimpleStorageManager(StorageManager):
             )
             raise RuntimeError(f"Error in put to storage unit {target_storage_unit}: {type(e).__name__}: {e}") from e
 
-    _pack_field_values = staticmethod(pack_field_values)
+    @staticmethod
+    def _pack_field_values(values: list) -> torch.Tensor | NonTensorStack:
+        """
+        Pack a list of per-sample values into a batched container.
+
+        For pure tensor lists (no None), this tries nested tensor
+        (jagged layout first, then strided fallback), then falls back to
+        ``NonTensorStack``. Scalar tensors are stacked densely.
+        Mixed types, non-tensor values, or lists containing None placeholders
+        are grouped into a ``NonTensorStack``.
+
+        Args:
+            values: List of per-sample values to pack. May contain None for
+                unfilled batch positions.
+
+        Returns:
+            A ``torch.Tensor`` (nested or dense) when all values are tensors,
+            otherwise a ``NonTensorStack``.
+
+        Raises:
+            ValueError: If *values* is empty.
+        """
+        if not values:
+            raise ValueError("_pack_field_values received empty values list; caller should filter empty batches")
+        non_none = [v for v in values if v is not None]
+        if non_none and all(isinstance(v, torch.Tensor) for v in non_none):
+            if len(non_none) == len(values):
+                # Scalar tensors cannot be represented as jagged nested tensors;
+                # stack them densely to avoid noisy fallback warnings.
+                if all(v.dim() == 0 for v in non_none):
+                    return torch.stack(non_none)
+                # Pure tensor list — try nested tensor
+                try:
+                    return torch.nested.as_nested_tensor(values, layout=torch.jagged)
+                except (RuntimeError, TypeError) as e:
+                    logger.warning(
+                        f"Failed to pack nested tensor with jagged layout. "
+                        f"Falling back to strided layout. Detailed error: {e}"
+                    )
+                    try:
+                        return torch.nested.as_nested_tensor(values, layout=torch.strided)
+                    except (RuntimeError, TypeError) as e2:
+                        logger.warning(
+                            f"Failed to pack nested tensor with strided layout. "
+                            f"Falling back to NonTensorStack. Detailed error: {e2}"
+                        )
+                        return NonTensorStack(*values)
+            # Mixed tensor + None — cannot create nested tensor, fall through to NonTensorStack
+        return NonTensorStack(*values)
 
     async def get_data(self, metadata: BatchMeta) -> TensorDict:
         """
@@ -705,177 +766,6 @@ class AsyncSimpleStorageManager(StorageManager):
             raise RuntimeError(
                 f"[{self.storage_manager_id}]: Error restoring for storage unit {target_storage_unit}: {str(e)}"
             ) from e
-
-    @with_storage_unit_socket
-    async def _dump_single_shard(
-        self,
-        path: str,
-        target_storage_unit: str,
-        global_indexes: list[int],
-        fields_by_index: dict[int, list[str]] | None = None,
-        socket: zmq.Socket = None,
-    ) -> dict[int, list[int]]:
-        """Ask one storage unit to write the rows it owns into a shard file."""
-        try:
-            request_msg = ZMQMessage.create(
-                request_type=ZMQRequestType.DUMP_ROWS,  # type: ignore[arg-type]
-                sender_id=self.storage_manager_id,
-                receiver_id=target_storage_unit,
-                body={"path": path, "global_indexes": global_indexes, "fields_by_index": fields_by_index},
-            )
-            await socket.send_multipart(request_msg.serialize(), copy=False)
-            messages = await socket.recv_multipart(copy=False)
-            response_msg = ZMQMessage.deserialize(messages)
-            if response_msg.request_type != ZMQRequestType.DUMP_ROWS_RESPONSE or not response_msg.body.get("success"):
-                raise RuntimeError(
-                    f"Storage unit {target_storage_unit} failed to dump rows to {path}: "
-                    f"{response_msg.body.get('message', 'unknown error')}"
-                )
-            missing_rows = response_msg.body["missing_rows"]
-            if missing_rows:
-                # The controller reported these rows as produced, so a unit that has no
-                # data for them means the two disagree. Never write a half table.
-                raise RuntimeError(
-                    f"Storage unit {target_storage_unit} holds no data for requested rows: {missing_rows[:20]}"
-                )
-            return response_msg.body["row_offsets"]
-        except Exception as e:
-            raise RuntimeError(
-                f"[{self.storage_manager_id}]: Error dumping shard from storage unit {target_storage_unit}: {str(e)}"
-            ) from e
-
-    async def dump_rows_by_index(
-        self,
-        shard_dir: str,
-        global_indexes: list[int],
-        fields_by_index: dict[int, list[str]] | None = None,
-    ) -> list[dict[str, Any]]:
-        """Dump the given rows into one shard per storage unit, in parallel.
-
-        Each unit pickles its own rows in its own process, so the payload never passes
-        through the caller. A unit that owns none of the rows is skipped rather than
-        writing an empty shard.
-
-        Args:
-            shard_dir: Directory to write shard files into.
-            global_indexes: Global indexes to dump.
-            fields_by_index: Produced fields to persist; omitted for a raw storage dump.
-
-        Returns:
-            One entry per written shard: ``{"position", "storage_unit_id", "rows", "row_offsets"}``.
-
-        Raises:
-            RuntimeError: A unit holds no data for a row it was asked to dump.
-        """
-        shard_dir_path = Path(shard_dir)
-        shard_dir_path.mkdir(parents=True, exist_ok=True)
-
-        routing = self._group_by_hash(global_indexes)
-        targets = [(su_id, group.global_indexes) for su_id, group in routing.items()]
-        paths = [str(shard_dir_path / f"shard_{pos}_{su_id}.pkl") for pos, (su_id, _) in enumerate(targets)]
-
-        row_offsets = await asyncio.gather(
-            *(
-                self._dump_single_shard(
-                    path,
-                    target_storage_unit=su_id,
-                    global_indexes=indexes,
-                    fields_by_index={index: fields_by_index[index] for index in indexes} if fields_by_index else None,
-                )
-                for path, (su_id, indexes) in zip(paths, targets, strict=True)
-            ),
-            return_exceptions=True,
-        )
-        shards = []
-        total_rows = 0
-        for pos, ((su_id, _), offsets) in enumerate(zip(targets, row_offsets, strict=True)):
-            if isinstance(offsets, BaseException):
-                raise offsets
-            total_rows += len(offsets)
-            shards.append({"position": pos, "storage_unit_id": su_id, "rows": len(offsets), "row_offsets": offsets})
-
-        logger.info(
-            f"[{self.storage_manager_id}]: dumped {total_rows} rows across {len(targets)} shards to {shard_dir_path}"
-        )
-        return shards
-
-    async def load_rows_by_index(
-        self, shards: list[dict[str, Any]], restore: dict | None = None
-    ) -> list[dict[str, Any]]:
-        """Have current owner units read assigned byte ranges concurrently."""
-        assignments = defaultdict(list)
-        for shard in shards:
-            rows = shard["records"]
-            for unit_id, group in self._group_by_hash([row["target_index"] for row in rows]).items():
-                assignments[unit_id].append(
-                    {
-                        **shard,
-                        "records": [rows[pos] for pos in group.batch_positions],
-                    }
-                )
-        results = await asyncio.gather(
-            *(
-                self._load_selected_rows(
-                    shards, target_storage_unit=unit_id, **({"restore": restore} if restore else {})
-                )
-                for unit_id, shards in assignments.items()
-            ),
-            return_exceptions=True,
-        )
-        # Local RPC completion is not remote completion; the controller retains reservations on timeout.
-        updates = []
-        bytes_read = 0
-        for result in results:
-            if isinstance(result, BaseException):
-                raise result
-            bytes_read += result["bytes_read"]
-            updates.extend(result["updates"])
-        logger.info(
-            "[%s]: loaded %s bytes across %s units",
-            self.storage_manager_id,
-            bytes_read,
-            len(assignments),
-        )
-        return updates
-
-    @with_storage_unit_socket
-    async def _load_selected_rows(
-        self,
-        shards: list[dict[str, Any]],
-        target_storage_unit: str,
-        restore: dict | None = None,
-        socket: zmq.Socket = None,
-    ) -> dict[str, Any]:
-        request = ZMQMessage.create(
-            request_type=ZMQRequestType.LOAD_ROWS,
-            sender_id=self.storage_manager_id,
-            receiver_id=target_storage_unit,
-            body={"shards": shards, "restore": restore},
-        )
-        await socket.send_multipart(request.serialize(), copy=False)
-        response = ZMQMessage.deserialize(await socket.recv_multipart(copy=False))
-        if response.request_type != ZMQRequestType.LOAD_ROWS_RESPONSE or not response.body.get("success"):
-            raise RuntimeError(
-                f"Storage unit {target_storage_unit} failed to load rows: {response.body.get('message')}"
-            )
-        return response.body
-
-    async def report_restore(self, restore: dict) -> None:
-        """Ask units to resend cached terminal results; unknown units cannot grant release."""
-        await asyncio.gather(
-            *(self._report_restore_unit(restore, target_storage_unit=unit) for unit in self.storage_unit_infos),
-            return_exceptions=True,
-        )
-
-    @with_storage_unit_socket
-    async def _report_restore_unit(self, restore: dict, target_storage_unit: str, socket: zmq.Socket = None) -> None:
-        request = ZMQMessage.create(
-            request_type=ZMQRequestType.REPORT_RESTORE, sender_id=self.storage_manager_id, body=restore
-        )
-        await socket.send_multipart(request.serialize())
-        response = ZMQMessage.deserialize(await socket.recv_multipart())
-        if response.request_type != ZMQRequestType.REPORT_RESTORE_RESPONSE or not response.body.get("success"):
-            raise RuntimeError("Storage unit could not report its restore result")
 
     async def save_checkpoint(self, checkpoint_dir: str) -> None:
         """Dump all storage units to the storage_units/ subdirectory of checkpoint_dir.
