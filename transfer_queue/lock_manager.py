@@ -16,6 +16,7 @@
 """Server side of ``kv_global_lock``: one async Ray actor holding leased per-key locks."""
 
 import asyncio
+import heapq
 import time
 
 import ray
@@ -33,10 +34,14 @@ class TransferQueueLockManager:
     def __init__(self):
         self._holder: dict[tuple[str, str], str] = {}  # name -> token
         self._leases: dict[str, dict] = {}  # token -> names, lease_s, expires_at, granted_at, info
+        # Min-heap of (expires_at, token). Release and renewal leave stale entries behind, which
+        # _expire skips, so neither has to search the heap.
+        self._expiries: list[tuple[float, str]] = []
         self._fences: dict[tuple[str, str], int] = {}  # never reset, so a key's fence only grows
-        self._waiting: dict[str, list[tuple[str, str]]] = {}  # token -> names it waits for
+        self._waiting: dict[str, tuple[list[tuple[str, str]], asyncio.Event]] = {}  # token -> names, wakeup
+        # name -> wakeups of its waiters, as an insertion-ordered dict so they wake oldest first
+        self._wakeups: dict[tuple[str, str], dict[asyncio.Event, None]] = {}
         self._withdrawn: dict[str, float] = {}  # token -> when its tombstone expires
-        self._changed = asyncio.Condition()
 
     def _free(self, token: str) -> bool:
         lease = self._leases.pop(token, None)
@@ -44,42 +49,61 @@ class TransferQueueLockManager:
             return False
         for name in lease["names"]:
             del self._holder[name]
-        self._changed.notify_all()
+            for wakeup in self._wakeups.get(name, ()):
+                wakeup.set()
         return True
+
+    def _expire(self, now: float) -> None:
+        while self._expiries and self._expiries[0][0] <= now:
+            expires_at, token = heapq.heappop(self._expiries)
+            lease = self._leases.get(token)
+            if lease is not None and lease["expires_at"] == expires_at:
+                self._free(token)
 
     async def acquire(self, names, token, timeout, lease_s, holder_info):
         """Grant all ``names`` at once; return ``({key: fence}, waited_s)``, or None on timeout or withdrawal."""
         start = time.monotonic()
         deadline = None if timeout is None else start + timeout
-        self._waiting[token] = names
+        # Freeing a name sets the wakeups of its waiters only, so a release costs O(its waiters)
+        # instead of waking every waiter on the actor.
+        wakeup = asyncio.Event()
+        self._waiting[token] = (names, wakeup)
+        for name in names:
+            self._wakeups.setdefault(name, {})[wakeup] = None
         try:
-            async with self._changed:
-                while True:
-                    now = time.monotonic()
-                    for expired in [t for t, lease in self._leases.items() if lease["expires_at"] <= now]:
-                        self._free(expired)
-                    if self._withdrawn.pop(token, None) is not None:
-                        return None
-                    # All-or-nothing: a waiter never holds part of its keys, so overlapping
-                    # requests cannot deadlock whatever order their keys come in.
-                    busy = [self._leases[self._holder[name]]["expires_at"] for name in names if name in self._holder]
-                    if not busy:
-                        for name in names:
-                            self._holder[name] = token
-                            self._fences[name] = self._fences.get(name, 0) + 1
-                        self._leases[token] = dict(
-                            names=names, lease_s=lease_s, expires_at=now + lease_s, granted_at=now, info=holder_info
-                        )
-                        return {key: self._fences[(pid, key)] for pid, key in names}, now - start
-                    if deadline is not None and now >= deadline:
-                        return None
-                    wake_at = min(busy) if deadline is None else min(*busy, deadline)
-                    try:
-                        await asyncio.wait_for(self._changed.wait(), wake_at - now)
-                    except asyncio.TimeoutError:
-                        pass
+            while True:
+                now = time.monotonic()
+                self._expire(now)
+                if self._withdrawn.pop(token, None) is not None:
+                    return None
+                # All-or-nothing: a waiter never holds part of its keys, so overlapping
+                # requests cannot deadlock whatever order their keys come in.
+                busy = [self._leases[self._holder[name]]["expires_at"] for name in names if name in self._holder]
+                if not busy:
+                    for name in names:
+                        self._holder[name] = token
+                        self._fences[name] = self._fences.get(name, 0) + 1
+                    self._leases[token] = dict(
+                        names=names, lease_s=lease_s, expires_at=now + lease_s, granted_at=now, info=holder_info
+                    )
+                    heapq.heappush(self._expiries, (now + lease_s, token))
+                    return {key: self._fences[(pid, key)] for pid, key in names}, now - start
+                if deadline is not None and now >= deadline:
+                    return None
+                # Nothing runs between this clear and the wait, so no wakeup can be missed. Waking
+                # at the earliest blocking expiry lets _expire free it without a background task.
+                wakeup.clear()
+                wake_at = min(busy) if deadline is None else min(*busy, deadline)
+                try:
+                    await asyncio.wait_for(wakeup.wait(), wake_at - now)
+                except asyncio.TimeoutError:
+                    pass
         finally:
             del self._waiting[token]
+            for name in names:
+                del self._wakeups[name][wakeup]
+                if not self._wakeups[name]:
+                    del self._wakeups[name]
 
     def renew_many(self, tokens: list[str]) -> dict[str, bool]:
         """Extend each live lease by its own ``lease_s``; an expired or released one stays lost."""
@@ -90,16 +114,17 @@ class TransferQueueLockManager:
             alive[token] = lease is not None and lease["expires_at"] > now
             if alive[token]:
                 lease["expires_at"] = now + lease["lease_s"]
+                heapq.heappush(self._expiries, (lease["expires_at"], token))
         return alive
 
     async def release(self, token: str) -> None:
         """Free ``token``'s locks, or withdraw its acquire if it is still waiting or has not arrived."""
-        async with self._changed:
-            if not self._free(token):
-                now = time.monotonic()
-                self._withdrawn = {t: until for t, until in self._withdrawn.items() if until > now}
-                self._withdrawn[token] = now + _WITHDRAWN_TTL_S
-                self._changed.notify_all()
+        if not self._free(token):
+            now = time.monotonic()
+            self._withdrawn = {t: until for t, until in self._withdrawn.items() if until > now}
+            self._withdrawn[token] = now + _WITHDRAWN_TTL_S
+            if token in self._waiting:
+                self._waiting[token][1].set()
 
     def list_locks(self, partition_id: str | None = None) -> dict:
         now = time.monotonic()
@@ -116,5 +141,5 @@ class TransferQueueLockManager:
                         lease_remaining_s=lease["expires_at"] - now,
                     )
                 )
-        waiters = sum(partition_id in (None, names[0][0]) for names in self._waiting.values())
+        waiters = sum(partition_id in (None, names[0][0]) for names, _ in self._waiting.values())
         return {"holders": holders, "waiters": waiters}
