@@ -18,6 +18,8 @@ import gc
 import importlib
 import os
 import signal
+import subprocess
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -389,11 +391,11 @@ def test_locked_wrappers_reject_the_wrong_kind_of_function():
 
 @pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
 @pytest.mark.filterwarnings("ignore:.*fork.*:DeprecationWarning")
-def test_forked_child_drops_the_parents_locks_leases_and_manager(monkeypatch):
+def test_forked_child_drops_the_parents_locks_leases_and_managers(monkeypatch):
     monkeypatch.setattr(kvl, "_registry", threading.Condition())
     monkeypatch.setattr(kvl, "_leases", {"parent-token": object()})
     monkeypatch.setattr(kvl, "_renewer_running", True)
-    monkeypatch.setattr(kvl, "_manager", object())
+    monkeypatch.setattr(kvl, "_managers", {0: object()})
     release, registry_held = threading.Event(), threading.Event()
 
     def hold_registry():
@@ -411,7 +413,7 @@ def test_forked_child_drops_the_parents_locks_leases_and_manager(monkeypatch):
             ok = False
             try:
                 with kv_local_lock("a", P, timeout=1):
-                    ok = kvl._leases == {} and kvl._manager is None and not kvl._renewer_running
+                    ok = kvl._leases == {} and kvl._managers == {} and not kvl._renewer_running
                     ok = ok and kvl._registry.acquire(blocking=False)
             finally:
                 os._exit(0 if ok else 1)
@@ -426,6 +428,24 @@ def test_forked_child_drops_the_parents_locks_leases_and_manager(monkeypatch):
         release.set()
         registry_holder.join()
         key_holder.join()
+
+
+def test_global_lock_shards_agree_across_processes_and_spread_keys():
+    names = [(P, f"key{i}") for i in range(800)]
+    shards = [kvl._shard(name, 8) for name in names]
+    assert all(60 < shards.count(shard) < 140 for shard in range(8))
+    # str hashes differ per PYTHONHASHSEED; the shard of a key must not.
+    script = "import transfer_queue.kv_lock as k; print([k._shard(('p', f'key{i}'), 8) for i in range(800)])"
+    for seed in ("1", "2"):
+        out = subprocess.run(
+            [sys.executable, "-c", script],
+            env={**os.environ, "PYTHONHASHSEED": seed},
+            capture_output=True,
+            text=True,
+            timeout=E2E_TIMEOUT,
+            check=True,
+        )
+        assert out.stdout.strip() == str(shards)
 
 
 @pytest.fixture

@@ -52,14 +52,23 @@ def test_owner_close_kills_controller(fake):
     ray.get_actor.side_effect = ValueError("no controller yet")
 
     iface.init(OmegaConf.create({}))
-    client, lock_manager = iface._TQ_CLIENT, iface._TQ_LOCK_MANAGER
-    assert iface._TQ_IS_OWNER and lock_manager is not None
+    client, lock_managers = iface._TQ_CLIENT, iface._TQ_LOCK_MANAGERS
+    assert iface._TQ_IS_OWNER and len(lock_managers) == 8
 
     iface.close()
     client.close.assert_called_once()
-    assert [c.args for c in ray.kill.call_args_list] == [(controller,), (lock_manager,)]
+    assert [c.args for c in ray.kill.call_args_list] == [(controller,)] + [(m,) for m in lock_managers]
     assert (iface._TQ_CLIENT, iface._TQ_CONTROLLER, iface._TQ_IS_OWNER) == (None, None, False)
-    assert iface._TQ_LOCK_MANAGER is None
+    assert iface._TQ_LOCK_MANAGERS == []
+
+
+@pytest.mark.parametrize("num_lock_shards", [0, "8"])
+def test_init_rejects_invalid_num_lock_shards(fake, num_lock_shards):
+    ray, _, controller_cls = fake
+    ray.get_actor.side_effect = ValueError("no controller yet")
+    with pytest.raises(ValueError, match="num_lock_shards"):
+        iface.init(OmegaConf.create({"controller": {"num_lock_shards": num_lock_shards}}))
+    controller_cls.options.assert_not_called()
 
 
 @pytest.mark.parametrize("lost_creation_race", [False, True], ids=["existing", "lost_creation_race"])

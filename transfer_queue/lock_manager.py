@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Server side of ``kv_global_lock``: one async Ray actor holding leased per-key locks."""
+"""Server side of ``kv_global_lock``: async Ray actors, each holding leased locks on the keys that hash to it."""
 
 import asyncio
 import heapq
@@ -31,7 +31,9 @@ _WITHDRAWN_TTL_S = 300
 class TransferQueueLockManager:
     """Exclusive leased locks on ``(partition_id, key)``. Runs on one event loop, so no thread locks."""
 
-    def __init__(self):
+    def __init__(self, num_shards: int):
+        # Kept so that a process that never ran tq.init() can learn how many shards to hash over.
+        self._num_shards = num_shards
         self._holder: dict[tuple[str, str], str] = {}  # name -> token
         self._leases: dict[str, dict] = {}  # token -> names, lease_s, expires_at, granted_at, info
         # Min-heap of (expires_at, token). Release and renewal leave stale entries behind, which
@@ -104,6 +106,9 @@ class TransferQueueLockManager:
                 del self._wakeups[name][wakeup]
                 if not self._wakeups[name]:
                     del self._wakeups[name]
+
+    def num_shards(self) -> int:
+        return self._num_shards
 
     def renew_many(self, tokens: list[str]) -> dict[str, bool]:
         """Extend each live lease by its own ``lease_s``; an expired or released one stays lost."""
