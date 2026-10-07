@@ -16,6 +16,8 @@
 import asyncio
 import gc
 import importlib
+import os
+import signal
 import threading
 import time
 from types import SimpleNamespace
@@ -383,6 +385,47 @@ def test_locked_wrappers_reject_the_wrong_kind_of_function():
         kv_local_locked(async_fn, "a", P)
     with pytest.raises(TypeError, match="coroutine function"):
         asyncio.run(async_kv_local_locked(lambda keys, partition_id: None, "a", P))
+
+
+@pytest.mark.skipif(not hasattr(os, "fork"), reason="needs os.fork")
+@pytest.mark.filterwarnings("ignore:.*fork.*:DeprecationWarning")
+def test_forked_child_drops_the_parents_locks_leases_and_manager(monkeypatch):
+    monkeypatch.setattr(kvl, "_registry", threading.Condition())
+    monkeypatch.setattr(kvl, "_leases", {"parent-token": object()})
+    monkeypatch.setattr(kvl, "_renewer_running", True)
+    monkeypatch.setattr(kvl, "_manager", object())
+    release, registry_held = threading.Event(), threading.Event()
+
+    def hold_registry():
+        with kvl._registry:
+            registry_held.set()
+            release.wait(TIMEOUT)
+
+    registry_holder = threading.Thread(target=hold_registry)
+    registry_holder.start()
+    assert registry_held.wait(TIMEOUT)
+    key_holder = start_holder("a", release)
+    try:
+        pid = os.fork()
+        if pid == 0:
+            ok = False
+            try:
+                with kv_local_lock("a", P, timeout=1):
+                    ok = kvl._leases == {} and kvl._manager is None and not kvl._renewer_running
+                    ok = ok and kvl._registry.acquire(blocking=False)
+            finally:
+                os._exit(0 if ok else 1)
+        deadline = time.monotonic() + TIMEOUT
+        while (status := os.waitpid(pid, os.WNOHANG))[0] == 0:
+            if time.monotonic() > deadline:
+                os.kill(pid, signal.SIGKILL)
+                pytest.fail("forked child hung")
+            time.sleep(0.01)
+        assert os.waitstatus_to_exitcode(status[1]) == 0
+    finally:
+        release.set()
+        registry_holder.join()
+        key_holder.join()
 
 
 @pytest.fixture

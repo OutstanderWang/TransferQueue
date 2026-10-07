@@ -40,6 +40,7 @@ def fake(monkeypatch):
     controller_cls.options.return_value.remote.return_value = controller
     monkeypatch.setattr(iface, "ray", ray)
     monkeypatch.setattr(iface, "TransferQueueController", controller_cls)
+    monkeypatch.setattr(iface, "TransferQueueLockManager", MagicMock(name="TransferQueueLockManager"))
     monkeypatch.setattr(iface, "TransferQueueClient", MagicMock(name="TransferQueueClient"))
     monkeypatch.setattr(iface, "process_zmq_server_info", MagicMock(return_value=None))
     monkeypatch.setattr(iface, "_maybe_create_tq_storage", lambda conf: conf)
@@ -51,13 +52,14 @@ def test_owner_close_kills_controller(fake):
     ray.get_actor.side_effect = ValueError("no controller yet")
 
     iface.init(OmegaConf.create({}))
-    client = iface._TQ_CLIENT
-    assert iface._TQ_IS_OWNER
+    client, lock_manager = iface._TQ_CLIENT, iface._TQ_LOCK_MANAGER
+    assert iface._TQ_IS_OWNER and lock_manager is not None
 
     iface.close()
     client.close.assert_called_once()
-    ray.kill.assert_called_once_with(controller)
+    assert [c.args for c in ray.kill.call_args_list] == [(controller,), (lock_manager,)]
     assert (iface._TQ_CLIENT, iface._TQ_CONTROLLER, iface._TQ_IS_OWNER) == (None, None, False)
+    assert iface._TQ_LOCK_MANAGER is None
 
 
 @pytest.mark.parametrize("lost_creation_race", [False, True], ids=["existing", "lost_creation_race"])
